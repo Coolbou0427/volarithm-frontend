@@ -1,5 +1,7 @@
 @echo off
-cd /d "d:\.Volarithm\prototype\web-interface"
+cd /d "d:\.Volarithm\web-interface"
+
+set PYTHON=d:\.Volarithm\prototype\.venv\Scripts\python.exe
 
 echo Starting Volarithm Server with HTTPS...
 echo.
@@ -7,10 +9,10 @@ echo.
 REM Check if SSL certificates exist
 if not exist "cert.pem" (
     echo SSL certificates not found. Generating...
-    python generate_ssl.py
+    %PYTHON% generate_ssl.py
     if errorlevel 1 (
         echo Failed to generate SSL certificates. Starting with HTTP...
-        python server.py
+        %PYTHON% server.py
         exit /b
     )
     echo.
@@ -25,4 +27,4 @@ echo Certificate: %SSL_CERT_PATH%
 echo Private Key: %SSL_KEY_PATH%
 echo.
 
-python server.py
+%PYTHON% server.py

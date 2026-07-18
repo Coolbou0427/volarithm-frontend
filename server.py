@@ -7,10 +7,14 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from starlette.middleware.gzip import GZipMiddleware
 from passlib.context import CryptContext
 from pydantic import BaseModel
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import secrets
 import os
 import json
+import tempfile
+import base64
+import hashlib
+import re
 from pathlib import Path
 import sys
 from datetime import datetime, timedelta, timezone
@@ -21,6 +25,15 @@ import csv
 import io
 import requests  # Polymarket data API
 from eth_account import Account  # derive public address from private key
+from eth_utils import to_checksum_address
+from Crypto.Cipher import AES
+
+# Windows/Python 3.13: avoid noisy Proactor transport reset tracebacks on client disconnects.
+if sys.platform.startswith("win"):
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())  # type: ignore[attr-defined]
+    except Exception:
+        pass
 # Resolve local project paths based on this file's location.
 SERVER_DIR = Path(__file__).resolve().parent
 
@@ -41,6 +54,8 @@ from settings import get_default_stake  # type: ignore
 from time_utils import now_et, today_noon_et, ET  # type: ignore
 from market_trading import resolve_bitcoin_updown_token_ids_for_date  # type: ignore
 from market_trading import clob_price  # reuse lightweight price helper (adjust if different source preferred)
+from market_trading import make_client  # validate session-key auth against CLOB
+from trade_ledger import is_confirmed_trade_record
 
 # Global cache for stats
 STATS_CACHE = {
@@ -48,6 +63,13 @@ STATS_CACHE = {
     'last_update': None,
     'update_interval': 30  # Update every 30 seconds instead of 5 minutes
 }
+
+YAHOO_CRUMB_CACHE: Dict[str, Any] = {"crumb": None, "expires_at": 0.0}
+
+# Cache for /api/prices/current — new data points are recorded every 60s so
+# there is no benefit in hitting the CLOB API more often than that.
+_CURRENT_PRICES_CACHE: Dict[str, Any] = {"data": None, "ts": 0.0}
+_CURRENT_PRICES_TTL = 55.0  # seconds
 
 
 BASE = MODULE_ROOT or SERVER_DIR.parent
@@ -62,6 +84,7 @@ BOT_STATUS_PATH = STATE / "bot_status.json"
 LOGS_DIR = BASE / "logs"
 HIST_CSV = BASE / "tester" / "btc_updown_last90.csv"
 TOKENS_PATH = STATE / "tokens.json"
+SESSION_MASTER_KEY_PATH = STATE / "session_keys_master.bin"
 
 # Derived paths/directories used later
 CHART_CACHE = STATE / "chart_cache"
@@ -116,6 +139,55 @@ class ControlUpdate(BaseModel):
     priority_side: Optional[str] = None  # "UP" / "DOWN"
 
 
+class TradingAccountCreate(BaseModel):
+    name: str
+    enabled: bool = False
+    priority: int = 0
+    funder: str
+    signature_type: Optional[int] = None
+    auth_mode: Optional[str] = None
+    wallet_owner: Optional[str] = None
+    safe_address: Optional[str] = None
+    private_key: Optional[str] = None
+    trading_session_key: Optional[str] = None
+    fee_session_key: Optional[str] = None
+
+
+class TradingAccountPatch(BaseModel):
+    enabled: Optional[bool] = None
+    priority: Optional[int] = None
+    funder: Optional[str] = None
+    signature_type: Optional[int] = None
+    auth_mode: Optional[str] = None
+    is_admin: Optional[bool] = None
+    wallet_owner: Optional[str] = None
+    safe_address: Optional[str] = None
+    clear_funder: Optional[bool] = False
+    private_key: Optional[str] = None
+    clear_private_key: Optional[bool] = False
+    trading_session_key: Optional[str] = None
+    fee_session_key: Optional[str] = None
+
+
+class TradingReorderRequest(BaseModel):
+    ordered_names: List[str]
+
+
+class UserTradingAccountUpdate(BaseModel):
+    enabled: Optional[bool] = None
+    priority: Optional[int] = None
+    funder: Optional[str] = None
+    signature_type: Optional[int] = None
+    auth_mode: Optional[str] = None
+    wallet_owner: Optional[str] = None
+    safe_address: Optional[str] = None
+    clear_funder: Optional[bool] = False
+    private_key: Optional[str] = None
+    clear_private_key: Optional[bool] = False
+    trading_session_key: Optional[str] = None
+    fee_session_key: Optional[str] = None
+
+
 # Simple token store (memory + disk persistence)
 TOKENS: Dict[str, Dict[str, Any]] = {}
 
@@ -147,8 +219,18 @@ def _save_tokens_file(tokens: Dict[str, Dict[str, Any]]):
             v2["exp"] = v2["exp"].isoformat()
         out[k] = v2
     try:
-        with open(TOKENS_PATH, "w", encoding="utf-8") as f:
-            json.dump(out, f, indent=2)
+        dir_ = str(TOKENS_PATH.parent)
+        fd, tmp_path = tempfile.mkstemp(dir=dir_, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(out, f, indent=2)
+            os.replace(tmp_path, TOKENS_PATH)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+            raise
     except Exception:
         pass
 
@@ -240,7 +322,7 @@ def calculate_fresh_stats():
     def _addr(acct: dict):
         # For Polymarket PnL queries, use the main wallet (derived from private key) first
         # because that's what shows up in the Polymarket profile
-        pk = acct.get('private_key')
+        pk = _decrypt_session_key(acct.get('private_key'))
         if isinstance(pk, str) and pk.startswith('0x') and len(pk) >= 66 and 'REPLACE_WITH_TEST' not in pk:
             try:
                 return Account.from_key(pk).address
@@ -313,7 +395,7 @@ def calculate_fresh_stats():
             return name
 
         for acct in accounts_cfg:
-            if not acct.get('enabled', True):
+            if not _is_account_enabled(acct):
                 continue
             name = _acct_name(acct)
             ledger = STATE / name / "trades.jsonl"
@@ -357,13 +439,13 @@ def calculate_fresh_stats():
         data_api_cash = 0.0
         data_api_realized = 0.0
         for acct in accounts_cfg:
-            if not acct.get('enabled', True):
+            if not _is_account_enabled(acct):
                 continue
             # Query both main wallet (from private key) and proxy wallet if different
             addresses = []
             
             # Main wallet (what shows in Polymarket profile)
-            pk = acct.get('private_key')
+            pk = _decrypt_session_key(acct.get('private_key'))
             if isinstance(pk, str) and pk.startswith('0x') and 'REPLACE_WITH_TEST' not in pk:
                 try:
                     main_addr = Account.from_key(pk).address
@@ -393,11 +475,11 @@ def calculate_fresh_stats():
         from balance_checker import get_polymarket_account_stats  # type: ignore
         clob_realized_sum = 0.0
         for acct in accounts_cfg:
-            if not acct.get('enabled', True):
+            if not _is_account_enabled(acct):
                 continue
             # Use same multi-address logic for CLOB API
             addresses = []
-            pk = acct.get('private_key')
+            pk = _decrypt_session_key(acct.get('private_key'))
             if isinstance(pk, str) and pk.startswith('0x') and 'REPLACE_WITH_TEST' not in pk:
                 try:
                     main_addr = Account.from_key(pk).address
@@ -426,13 +508,13 @@ def calculate_fresh_stats():
             details = []
             seen = set()
             for acct in accounts_cfg:
-                if not acct.get('enabled', True):
+                if not _is_account_enabled(acct):
                     continue
                 addr = _addr(acct)
                 if not addr or addr.lower() in seen:
                     continue
                 seen.add(addr.lower())
-                pk = acct.get('private_key') if isinstance(acct.get('private_key'), str) else None
+                pk = _decrypt_session_key(acct.get('private_key'))
                 pnl = _polymarket_total_pnl(addr, pk)
                 r = float(pnl.get("realized", 0.0) or 0.0)
                 u = float(pnl.get("unrealized", 0.0) or 0.0)
@@ -603,6 +685,590 @@ def _save_users(db: dict):
         json.dump(db, f, indent=2)
 
 
+HEX_32B_RE = re.compile(r"^(0x)?[0-9a-fA-F]{64}$")
+ETH_ADDR_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+ENC_PREFIX = "enc:v1:"
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _loop_exception_handler(loop: asyncio.AbstractEventLoop, context: dict):
+    exc = context.get("exception")
+    if isinstance(exc, ConnectionResetError):
+        # Common on Windows when browser aborts a socket; safe to ignore.
+        return
+    loop.default_exception_handler(context)
+
+
+def _normalize_private_key(value: str) -> str:
+    v = str(value or "").strip()
+    if not HEX_32B_RE.match(v):
+        raise HTTPException(status_code=400, detail="Invalid key format: expected 32-byte hex private key")
+    if not v.startswith("0x"):
+        v = "0x" + v
+    return v.lower()
+
+
+def _generate_private_key_hex() -> str:
+    return "0x" + secrets.token_hex(32)
+
+
+def _clob_api_base() -> str:
+    return os.environ.get("CLOB_API_BASE", "https://clob.polymarket.com").strip() or "https://clob.polymarket.com"
+
+
+def _chain_id_default() -> int:
+    txt = os.environ.get("CHAIN_ID", "137").strip()
+    try:
+        return int(txt)
+    except Exception:
+        return 137
+
+
+def _safe_tx_hosts_for_chain(chain_id: int) -> List[str]:
+    host_map = {
+        1: ["https://api.safe.global/tx-service/eth", "https://safe-transaction-mainnet.safe.global"],
+        10: ["https://api.safe.global/tx-service/oeth", "https://safe-transaction-optimism.safe.global"],
+        56: ["https://api.safe.global/tx-service/bnb", "https://safe-transaction-bsc.safe.global"],
+        100: ["https://api.safe.global/tx-service/gno", "https://safe-transaction-gnosis-chain.safe.global"],
+        137: ["https://api.safe.global/tx-service/pol", "https://safe-transaction-polygon.safe.global"],
+        42161: ["https://api.safe.global/tx-service/arb1", "https://safe-transaction-arbitrum.safe.global"],
+        43114: ["https://api.safe.global/tx-service/avax", "https://safe-transaction-avalanche.safe.global"],
+        8453: ["https://api.safe.global/tx-service/base", "https://safe-transaction-base.safe.global"],
+    }
+    preferred = host_map.get(chain_id, [])
+    all_hosts = []
+    for values in host_map.values():
+        for h in values:
+            if h not in all_hosts:
+                all_hosts.append(h)
+    return preferred + [h for h in all_hosts if h not in preferred]
+
+
+def _safe_client_gateway_base() -> str:
+    return os.environ.get("SAFE_CLIENT_GATEWAY_BASE", "https://safe-client.safe.global").strip() or "https://safe-client.safe.global"
+
+
+def _polygon_rpc_url() -> str:
+    return os.environ.get("POLYGON_RPC_URL", "https://polygon-rpc.com").strip() or "https://polygon-rpc.com"
+
+
+def _yahoo_user_agent() -> str:
+    return (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
+
+
+def _parse_json_list_maybe(value):
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, list):
+                return parsed
+        except Exception:
+            return None
+    return None
+
+
+def _daily_btc_slug(target_date, include_year: bool = False) -> str:
+    base = f"bitcoin-up-or-down-on-{target_date.strftime('%B').lower()}-{target_date.day}"
+    return f"{base}-{target_date.year}" if include_year else base
+
+
+def _market_end_year(market: Optional[dict]) -> Optional[int]:
+    if not isinstance(market, dict):
+        return None
+    end_txt = market.get("endDate") or market.get("end_date") or market.get("endDateIso")
+    if not end_txt:
+        return None
+    try:
+        # Handles both ISO datetime and date-only values.
+        dt = datetime.fromisoformat(str(end_txt).replace("Z", "+00:00"))
+        return dt.year
+    except Exception:
+        try:
+            return int(str(end_txt)[:4])
+        except Exception:
+            return None
+
+
+def _extract_up_down_ids_from_market(market: Optional[dict]) -> tuple[Optional[str], Optional[str]]:
+    if not isinstance(market, dict):
+        return None, None
+    raw_tokens = (
+        market.get("clobTokenIds")
+        or market.get("clob_token_ids")
+        or market.get("tokenIds")
+        or market.get("token_ids")
+        or market.get("tokens")
+    )
+    tokens = _parse_json_list_maybe(raw_tokens) or (raw_tokens if isinstance(raw_tokens, list) else None) or []
+    tokens = [str(t) for t in tokens if t is not None]
+    if len(tokens) < 2:
+        return None, None
+
+    raw_outcomes = market.get("outcomes") or market.get("outcomeNames") or market.get("outcome_names")
+    outcomes = _parse_json_list_maybe(raw_outcomes) or (raw_outcomes if isinstance(raw_outcomes, list) else None) or []
+    outcomes = [str(o or "").strip().upper() for o in outcomes]
+    if len(outcomes) >= 2:
+        idx_up = next((i for i, v in enumerate(outcomes) if v == "UP"), None)
+        idx_dn = next((i for i, v in enumerate(outcomes) if v == "DOWN"), None)
+        if idx_up is not None and idx_dn is not None and idx_up < len(tokens) and idx_dn < len(tokens):
+            return tokens[idx_up], tokens[idx_dn]
+    return tokens[0], tokens[1]
+
+
+def _fetch_gamma_market_by_slug(slug: str) -> Optional[dict]:
+    slug = str(slug or "").strip()
+    if not slug:
+        return None
+    try:
+        headers = {"Accept": "application/json", "User-Agent": _yahoo_user_agent()}
+        resp = requests.get("https://gamma-api.polymarket.com/markets", params={"slug": slug}, timeout=6.5, headers=headers)
+        if resp.status_code != 200:
+            return None
+        data = resp.json() if resp.content else []
+        markets = data if isinstance(data, list) else data.get("data", [])
+        if not isinstance(markets, list) or not markets:
+            return None
+        exact = [m for m in markets if isinstance(m, dict) and str(m.get("slug") or "").strip() == slug]
+        pool = exact if exact else [m for m in markets if isinstance(m, dict)]
+        if not pool:
+            return None
+        # Prefer currently tradeable rows first.
+        pool.sort(key=lambda m: (
+            0 if not bool(m.get("closed")) else 1,
+            0 if bool(m.get("acceptingOrders")) else 1,
+        ))
+        return pool[0]
+    except Exception:
+        return None
+
+
+def _resolve_market_for_date(target_date):
+    """
+    Resolve market for a specific day, preferring the year-specific slug so we do not
+    accidentally pick a same month/day market from a previous year.
+    """
+    # Try existing resolver first.
+    up_id = dn_id = None
+    market = None
+    try:
+        up_id, dn_id, market = resolve_bitcoin_updown_token_ids_for_date(target_date)
+    except Exception:
+        up_id = dn_id = None
+        market = None
+
+    end_year = _market_end_year(market)
+    if up_id and dn_id and end_year == target_date.year:
+        return up_id, dn_id, market
+
+    # Fallback to Gamma with year-specific slug.
+    year_slug = _daily_btc_slug(target_date, include_year=True)
+    gamma_market = _fetch_gamma_market_by_slug(year_slug)
+    g_up, g_dn = _extract_up_down_ids_from_market(gamma_market)
+    if g_up and g_dn:
+        return g_up, g_dn, gamma_market
+
+    # Last fallback: non-year slug from this codebase.
+    base_slug = _daily_btc_slug(target_date, include_year=False)
+    gamma_market2 = _fetch_gamma_market_by_slug(base_slug)
+    g2_up, g2_dn = _extract_up_down_ids_from_market(gamma_market2)
+    if g2_up and g2_dn:
+        return g2_up, g2_dn, gamma_market2
+
+    # Return whatever original resolver gave (even if stale) to preserve behavior.
+    if up_id and dn_id:
+        return up_id, dn_id, market
+    raise RuntimeError(f"Could not resolve market for {target_date.isoformat()}")
+
+
+def _yahoo_get_crumb(session: requests.Session) -> Optional[str]:
+    now = time.time()
+    cached = YAHOO_CRUMB_CACHE.get("crumb")
+    exp = float(YAHOO_CRUMB_CACHE.get("expires_at") or 0.0)
+    if isinstance(cached, str) and cached and now < exp:
+        return cached
+    try:
+        session.get("https://finance.yahoo.com/", timeout=4.5, headers={"User-Agent": _yahoo_user_agent()})
+        r = session.get(
+            "https://query1.finance.yahoo.com/v1/test/getcrumb",
+            timeout=4.5,
+            headers={"User-Agent": _yahoo_user_agent(), "Accept": "text/plain"},
+        )
+        if r.status_code == 200:
+            crumb = (r.text or "").strip()
+            if crumb and " " not in crumb and "<" not in crumb:
+                YAHOO_CRUMB_CACHE["crumb"] = crumb
+                YAHOO_CRUMB_CACHE["expires_at"] = now + 15 * 60
+                return crumb
+    except Exception:
+        return None
+    return None
+
+
+def _polygon_usdc_balance(safe_addr: Optional[str]) -> tuple[Optional[float], Dict[str, float]]:
+    if not isinstance(safe_addr, str) or not ETH_ADDR_RE.match(safe_addr):
+        return None, {}
+    # Native USDC and legacy USDC.e on Polygon
+    token_map = {
+        "USDC": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359",
+        "USDC.e": "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
+    }
+    rpc = _polygon_rpc_url()
+    owner_hex = safe_addr.lower().replace("0x", "")
+    data = "0x70a08231" + ("0" * 24) + owner_hex
+    total = 0.0
+    per_token: Dict[str, float] = {}
+    for sym, token in token_map.items():
+        body = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_call",
+            "params": [
+                {"to": token, "data": data},
+                "latest",
+            ],
+        }
+        try:
+            resp = requests.post(rpc, json=body, timeout=8)
+            if resp.status_code != 200:
+                continue
+            payload = resp.json() if resp.content else {}
+            raw = payload.get("result")
+            if not isinstance(raw, str) or not raw.startswith("0x"):
+                continue
+            bal = int(raw, 16) / 1_000_000.0  # USDC is 6 decimals
+            if bal > 0:
+                per_token[sym] = bal
+                total += bal
+        except Exception:
+            continue
+    return total, per_token
+
+
+def _safe_owners_from_address(safe_addr: Optional[str], chain_id: Optional[int] = None) -> List[str]:
+    if not isinstance(safe_addr, str) or not ETH_ADDR_RE.match(safe_addr):
+        return []
+    cid = int(chain_id if chain_id is not None else _chain_id_default())
+    owners: List[str] = []
+    seen = set()
+
+    def _add_owner(v: Optional[str]):
+        if not isinstance(v, str):
+            return
+        o = v.strip()
+        if not ETH_ADDR_RE.match(o):
+            return
+        key = o.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        owners.append(o)
+
+    def _collect(url: str):
+        try:
+            resp = requests.get(url, timeout=8)
+            if resp.status_code != 200:
+                return
+            data = resp.json() if resp.content else {}
+            # Safe client gateway can nest owners under "owners"
+            if isinstance(data, dict):
+                olist = data.get("owners")
+                if isinstance(olist, list):
+                    for item in olist:
+                        if isinstance(item, str):
+                            _add_owner(item)
+                        elif isinstance(item, dict):
+                            _add_owner(item.get("value") or item.get("address"))
+            # Tx service /api/v1/safes/{safe}/ has owners as list[str]
+            if isinstance(data, dict):
+                olist2 = data.get("owners")
+                if isinstance(olist2, list):
+                    for item in olist2:
+                        if isinstance(item, str):
+                            _add_owner(item)
+        except Exception:
+            return
+
+    gateway = _safe_client_gateway_base().rstrip("/")
+    for url in [
+        f"{gateway}/v1/chains/{cid}/safes/{safe_addr}",
+        f"{gateway}/v2/chains/{cid}/safes/{safe_addr}",
+    ]:
+        _collect(url)
+
+    for host in _safe_tx_hosts_for_chain(cid):
+        _collect(f"{host}/api/v1/safes/{safe_addr}/")
+
+    return owners
+
+
+def _normalize_eth_address(value: str, field_name: str = "address") -> str:
+    v = str(value or "").strip()
+    if not ETH_ADDR_RE.match(v):
+        raise HTTPException(status_code=400, detail=f"Invalid {field_name}: expected 0x-prefixed 20-byte hex address")
+    return v
+
+
+def _checksum_eth_address(value: str) -> str:
+    try:
+        return to_checksum_address(value)
+    except Exception:
+        return value
+
+
+def _session_master_key() -> Optional[bytes]:
+    raw = os.environ.get("TRADING_KEYS_MASTER_KEY") or os.environ.get("SESSION_KEYS_MASTER_KEY")
+    if raw:
+        txt = raw.strip()
+        if len(txt) == 64 and all(c in "0123456789abcdefABCDEF" for c in txt):
+            return bytes.fromhex(txt)
+        try:
+            dec = base64.b64decode(txt, validate=True)
+            if len(dec) == 32:
+                return dec
+        except Exception:
+            pass
+        return hashlib.sha256(txt.encode("utf-8")).digest()
+
+    # Local fallback: persist a random 32-byte key on disk for this server instance.
+    # This keeps encryption working even if env vars are not configured.
+    try:
+        if SESSION_MASTER_KEY_PATH.exists():
+            data = SESSION_MASTER_KEY_PATH.read_bytes()
+            if len(data) == 32:
+                return data
+        mk = secrets.token_bytes(32)
+        SESSION_MASTER_KEY_PATH.write_bytes(mk)
+        return mk
+    except Exception:
+        return None
+
+
+def _encrypt_session_key(raw_key: str) -> str:
+    mk = _session_master_key()
+    if not mk:
+        raise HTTPException(status_code=500, detail="Session-key encryption is not configured on server")
+    nonce = secrets.token_bytes(12)
+    cipher = AES.new(mk, AES.MODE_GCM, nonce=nonce)
+    ct, tag = cipher.encrypt_and_digest(raw_key.encode("utf-8"))
+    blob = base64.b64encode(nonce + tag + ct).decode("ascii")
+    return ENC_PREFIX + blob
+
+
+def _decrypt_session_key(stored: Optional[str]) -> Optional[str]:
+    if not isinstance(stored, str) or not stored:
+        return None
+    if not stored.startswith(ENC_PREFIX):
+        return stored
+    mk = _session_master_key()
+    if not mk:
+        return None
+    try:
+        data = base64.b64decode(stored[len(ENC_PREFIX):].encode("ascii"))
+        nonce, tag, ct = data[:12], data[12:28], data[28:]
+        cipher = AES.new(mk, AES.MODE_GCM, nonce=nonce)
+        plain = cipher.decrypt_and_verify(ct, tag)
+        return plain.decode("utf-8")
+    except Exception:
+        return None
+
+
+def _masked_preview(stored_key: Optional[str]) -> Optional[str]:
+    plain = _decrypt_session_key(stored_key)
+    if not isinstance(plain, str):
+        return None
+    v = plain if plain.startswith("0x") else ("0x" + plain)
+    if len(v) < 10:
+        return None
+    return f"{v[:6]}...{v[-4:]}"
+
+
+def _verify_trading_session_key_for_auth(raw_key: str, funder: str, signature_type: int) -> tuple[bool, str]:
+    """Best-effort CLOB auth probe for trading key + funder/signature context."""
+    try:
+        client = make_client(
+            _clob_api_base(),
+            raw_key,
+            _chain_id_default(),
+            proxy_wallet=funder,
+            signature_type=signature_type,
+        )
+    except Exception as e:
+        return False, f"client init failed: {e}"
+
+    # Probe an authenticated endpoint. If this fails, key/context is not usable yet.
+    try:
+        try:
+            client.get_orders(status="open")
+        except TypeError:
+            client.get_orders()
+        return True, "ok"
+    except Exception as e:
+        return False, f"auth probe failed: {e}"
+
+
+def _trading_accounts_ref(db: dict) -> List[dict]:
+    cfg = db.setdefault("_trading_config", {})
+    accts = cfg.setdefault("accounts", [])
+    if not isinstance(accts, list):
+        cfg["accounts"] = []
+        accts = cfg["accounts"]
+    return accts
+
+
+def _find_trading_account(accounts: List[dict], name: str) -> Optional[dict]:
+    for acct in accounts:
+        if str(acct.get("name")) == name:
+            return acct
+    return None
+
+
+def _upsert_user_trading_account(db: dict, username: str) -> dict:
+    accounts = _trading_accounts_ref(db)
+    acct = _find_trading_account(accounts, username)
+    if acct:
+        _sync_account_enable_flags(acct)
+        return acct
+    acct = {
+        "name": username,
+        "enabled": False,
+        "user_enabled": False,
+        "admin_enabled": False,
+        "priority": 0,
+        "signature_type": 2,
+        "trading_session_verified": False,
+        "key_version": 1,
+    }
+    accounts.append(acct)
+    return acct
+
+
+def _sync_account_enable_flags(acct: dict) -> None:
+    """
+    Keep legacy `enabled` and split flags in sync.
+    Effective trading permission is user_enabled AND admin_enabled.
+    """
+    legacy_enabled = bool(acct.get("enabled", True))
+    if "user_enabled" not in acct:
+        acct["user_enabled"] = legacy_enabled
+    if "admin_enabled" not in acct:
+        acct["admin_enabled"] = legacy_enabled
+    acct["enabled"] = bool(acct.get("user_enabled", False)) and bool(acct.get("admin_enabled", False))
+
+
+def _is_account_enabled(acct: dict) -> bool:
+    _sync_account_enable_flags(acct)
+    return bool(acct.get("enabled", False))
+
+
+def _is_admin_or_founders_account(db: dict, name: Optional[str]) -> bool:
+    n = str(name or "").strip()
+    if not n:
+        return False
+    if n.lower() == "founders":
+        return True
+    row = db.get(n)
+    return bool(isinstance(row, dict) and row.get("is_admin", False))
+
+
+def _derive_signer_address(acct: dict, update_key: Optional[str] = None) -> Optional[str]:
+    plain = update_key
+    if not plain:
+        plain = (
+            _decrypt_session_key(acct.get("trading_session_key"))
+            or _decrypt_session_key(acct.get("session_key"))
+            or _decrypt_session_key(acct.get("private_key"))
+        )
+    if not isinstance(plain, str):
+        return None
+    try:
+        return Account.from_key(plain).address
+    except Exception:
+        return None
+
+
+def _normalize_auth_mode(value: Optional[str]) -> str:
+    mode = str(value or "session_key").strip().lower().replace("-", "_")
+    if mode in {"session", "session_keys", "session_key"}:
+        return "session_key"
+    if mode in {"private", "private_key", "wallet_private_key"}:
+        return "private_key"
+    raise HTTPException(status_code=400, detail="auth_mode must be session_key or private_key")
+
+
+def _account_auth_mode(acct: dict) -> str:
+    return _normalize_auth_mode(acct.get("auth_mode") or "session_key")
+
+
+def _private_key_address(stored_key: Optional[str]) -> Optional[str]:
+    plain = _decrypt_session_key(stored_key)
+    if not isinstance(plain, str):
+        return None
+    try:
+        return Account.from_key(plain).address
+    except Exception:
+        return None
+
+
+def _key_expired(expires_at_iso: Optional[str]) -> bool:
+    """Return True if the given ISO expiry timestamp is in the past."""
+    if not expires_at_iso:
+        return False
+    try:
+        exp = datetime.fromisoformat(expires_at_iso.replace("Z", "+00:00"))
+        return datetime.now(timezone.utc) > exp
+    except Exception:
+        return False
+
+
+def _sanitize_trading_account(acct: dict) -> dict:
+    _sync_account_enable_flags(acct)
+    auth_mode = _account_auth_mode(acct)
+    trading_raw = acct.get("trading_session_key") or acct.get("session_key")
+    fee_raw = acct.get("fee_session_key") or acct.get("fees_session_key") or acct.get("fee_key")
+    private_raw = acct.get("private_key")
+    trading_expired = bool(trading_raw) and _key_expired(acct.get("trading_session_expires_at"))
+    fee_expired = bool(fee_raw) and _key_expired(acct.get("fee_session_expires_at"))
+    has_private_key = bool(_decrypt_session_key(private_raw))
+    return {
+        "name": acct.get("name"),
+        "enabled": bool(acct.get("enabled", False)),
+        "user_enabled": bool(acct.get("user_enabled", False)),
+        "admin_enabled": bool(acct.get("admin_enabled", False)),
+        "admin_locked": not bool(acct.get("admin_enabled", False)),
+        "priority": int(acct.get("priority", 0) or 0),
+        "funder": acct.get("funder") or acct.get("proxy_wallet"),
+        "wallet_owner": acct.get("wallet_owner"),
+        "safe_address": acct.get("safe_address"),
+        "signature_type": acct.get("signature_type"),
+        "auth_mode": auth_mode,
+        "has_private_key": has_private_key,
+        "has_active_trading_key": has_private_key if auth_mode == "private_key" else bool(trading_raw),
+        "has_trading_session_key": bool(trading_raw),
+        "has_fee_session_key": bool(fee_raw),
+        "trading_key_expired": trading_expired,
+        "fee_key_expired": fee_expired,
+        "trading_session_key_preview": _masked_preview(trading_raw),
+        "fee_session_key_preview": _masked_preview(fee_raw),
+        "trading_session_updated_at": acct.get("trading_session_updated_at"),
+        "trading_session_expires_at": acct.get("trading_session_expires_at"),
+        "trading_session_verified": bool(acct.get("trading_session_verified", False)),
+        "trading_session_verified_at": acct.get("trading_session_verified_at"),
+        "trading_session_verification_error": acct.get("trading_session_verification_error"),
+        "fee_session_updated_at": acct.get("fee_session_updated_at"),
+        "fee_session_expires_at": acct.get("fee_session_expires_at"),
+        "key_version": acct.get("key_version", 1),
+    }
+
+
 def verify_password(plain, hashed) -> bool:
     try:
         return pwd_context.verify(plain, hashed)
@@ -615,27 +1281,20 @@ def hash_password(plain) -> str:
 
 
 def get_current_user(token: str = Depends(oauth2_scheme)) -> User:
-    print(f"[DEBUG] get_current_user called with token: {token[:10] if token else 'None'}...")
     info = TOKENS.get(token)
-    print(f"[DEBUG] Token found in memory: {bool(info)}")
     if not info:
         # Fallback to on-disk tokens (survive server restarts)
         disk = _load_tokens_file()
-        print(f"[DEBUG] Loaded {len(disk)} tokens from disk")
         if disk:
             TOKENS.update(disk)
             info = TOKENS.get(token)
-            print(f"[DEBUG] Token found after disk load: {bool(info)}")
     if not info:
-        print(f"[DEBUG] No token info found, raising 401")
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
     # Expiry check
     if info.get("exp") and datetime.utcnow() > info["exp"]:
-        print(f"[DEBUG] Token expired, removing")
         TOKENS.pop(token, None)
         _save_tokens_file(TOKENS)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired")
-    print(f"[DEBUG] Token valid for user: {info['username']}")
     return User(username=info["username"], is_admin=info.get("is_admin", False))
 
 
@@ -653,27 +1312,44 @@ def require_bot_running(user: User = Depends(get_current_user)) -> User:
     return user
 
 
+def _validate_username_rules(username: str) -> Optional[str]:
+    candidate = str(username or "").strip()
+    if len(candidate) < 8:
+        return "Username must be at least 8 characters"
+    if not re.fullmatch(r"[A-Za-z0-9_]+", candidate):
+        return "Username can only use letters, numbers, and underscores"
+    return None
+
+
+def _validate_password_rules(password: str) -> Optional[str]:
+    value = str(password or "")
+    if len(value) < 10:
+        return "Weak password: min 10 chars, mix of letters and numbers"
+    if len(value) > 20:
+        return "Password must be 20 characters or fewer"
+    if not any(c.isdigit() for c in value) or not any(c.isalpha() for c in value):
+        return "Weak password: min 10 chars, mix of letters and numbers"
+    return None
+
+
 # --- Auth endpoints ---
 @app.post("/api/signup")
 def signup(new_user: UserCreate):
     db = _load_users()
-    if new_user.username in db:
-        raise HTTPException(status_code=400, detail="Username exists")
-    
-    # Validate username format
-    if new_user.username.startswith("_"):
-        raise HTTPException(status_code=400, detail="Username cannot start with underscore (reserved for system use)")
-    if not new_user.username.strip():
-        raise HTTPException(status_code=400, detail="Username cannot be empty")
-    if len(new_user.username) < 2:
-        raise HTTPException(status_code=400, detail="Username must be at least 2 characters")
+    username_norm = str(new_user.username or "").strip()
+    rule_error = _validate_username_rules(username_norm)
+    if rule_error:
+        raise HTTPException(status_code=400, detail=rule_error)
+    if any(str(name).lower() == username_norm.lower() for name in db.keys()):
+        raise HTTPException(status_code=400, detail="Username unavailable")
     
     # Validate password strength
-    if len(new_user.password) < 10 or not any(c.isdigit() for c in new_user.password) or not any(c.isalpha() for c in new_user.password):
-        raise HTTPException(status_code=400, detail="Weak password: min 10 chars, mix of letters and numbers")
+    password_error = _validate_password_rules(new_user.password)
+    if password_error:
+        raise HTTPException(status_code=400, detail=password_error)
     # First user becomes admin automatically
     is_first_user = len(db) == 0
-    db[new_user.username] = {
+    db[username_norm] = {
         "password": hash_password(new_user.password),
         "is_admin": True if is_first_user else bool(new_user.is_admin),
         "paused": False,
@@ -714,16 +1390,31 @@ def get_profile(user: User = Depends(get_current_user)):
     db = _load_users()
     row = db.get(user.username) or {}
     pk = row.get("private_key")
-    hint = None
-    if isinstance(pk, str) and len(pk) >= 6:
-        hint = "…" + pk[-4:]
     return {
         "username": user.username,
         "paused": bool(row.get("paused", False)),
         "timezone": row.get("timezone") or "America/Los_Angeles",
         "has_private_key": bool(pk),
-        "private_key_hint": hint,
     }
+
+
+@app.get("/api/username-availability")
+@app.get("/api/user/username-availability")
+def username_availability(username: str, user: User = Depends(get_current_user)):
+    username_norm = str(username or "").strip()
+    rule_error = _validate_username_rules(username_norm)
+    if rule_error:
+        return {"available": False, "reason": rule_error}
+
+    current_username = str(user.username or "").strip()
+    if username_norm.lower() == current_username.lower():
+        return {"available": True, "is_current": True}
+
+    db = _load_users()
+    taken = any(str(name).lower() == username_norm.lower() for name in db.keys())
+    if taken:
+        return {"available": False, "reason": "Username unavailable"}
+    return {"available": True}
 
 
 @app.post("/api/user/profile")
@@ -742,21 +1433,36 @@ def update_profile(update: ProfileUpdate, user: User = Depends(get_current_user)
         db[user.username] = row
     # Change username (no password required when logged in)
     if update.new_username:
-        if update.new_username in db and update.new_username != user.username:
-            raise HTTPException(status_code=400, detail="Username already taken")
-        db[update.new_username] = row
+        new_username = str(update.new_username).strip()
+        rule_error = _validate_username_rules(new_username)
+        if rule_error:
+            raise HTTPException(status_code=400, detail=rule_error)
+        old_username = user.username
+        taken = any(
+            str(name).lower() == new_username.lower() and str(name).lower() != str(old_username).lower()
+            for name in db.keys()
+        )
+        if taken:
+            raise HTTPException(status_code=400, detail="Username unavailable")
+        db[new_username] = row
         db.pop(user.username, None)
-        user.username = update.new_username
+        user.username = new_username
+        # Keep per-user trading account entry aligned with username changes.
+        accounts = _trading_accounts_ref(db)
+        acct = _find_trading_account(accounts, old_username)
+        if acct:
+            acct["name"] = new_username
         # propagate to active token
         if token in TOKENS:
-            TOKENS[token]["username"] = update.new_username
+            TOKENS[token]["username"] = new_username
             _save_tokens_file(TOKENS)
     # Change password
     if update.new_password:
         if not update.old_password or not verify_password(update.old_password, row.get("password", "")):
             raise HTTPException(status_code=400, detail="Current password incorrect")
-        if len(update.new_password) < 10 or not any(c.isdigit() for c in update.new_password) or not any(c.isalpha() for c in update.new_password):
-            raise HTTPException(status_code=400, detail="Weak password: min 10 chars, mix of letters and numbers")
+        password_error = _validate_password_rules(update.new_password)
+        if password_error:
+            raise HTTPException(status_code=400, detail=password_error)
         target = db.get(user.username) or row
         target["password"] = hash_password(update.new_password)
     # Pause toggle
@@ -783,6 +1489,318 @@ def update_profile(update: ProfileUpdate, user: User = Depends(get_current_user)
     return {"ok": True}
 
 
+@app.get("/api/user/trading-account")
+def get_user_trading_account(user: User = Depends(get_current_user)):
+    db = _load_users()
+    acct = _find_trading_account(_trading_accounts_ref(db), user.username)
+    if not acct:
+        return {
+            "exists": False,
+            "account": {
+                "name": user.username,
+                "enabled": False,
+                "user_enabled": False,
+                "admin_enabled": False,
+                "admin_locked": True,
+                "is_admin_or_founders": _is_admin_or_founders_account(db, user.username),
+                "requires_fee_key": not _is_admin_or_founders_account(db, user.username),
+                "priority": 0,
+                "signature_type": 2,
+                "auth_mode": "session_key",
+                "has_private_key": False,
+                "has_active_trading_key": False,
+                "has_trading_session_key": False,
+                "has_fee_session_key": False,
+            },
+        }
+    out = _sanitize_trading_account(acct)
+    privileged = _is_admin_or_founders_account(db, acct.get("name"))
+    out["is_admin_or_founders"] = privileged
+    out["requires_fee_key"] = not privileged
+    return {"exists": True, "account": out}
+
+
+@app.get("/api/wallet/safes")
+def detect_wallet_safes(owner: str, chain_id: Optional[int] = None, user: User = Depends(get_current_user)):
+    owner_norm = _checksum_eth_address(_normalize_eth_address(owner, "owner"))
+    cid = int(chain_id if chain_id is not None else _chain_id_default())
+    found: List[str] = []
+    seen = set()
+
+    def _collect_from_url(url: str):
+        try:
+            resp = requests.get(
+                url,
+                timeout=2.5,
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": "Volarithm-Web/1.0",
+                },
+            )
+            if resp.status_code != 200:
+                return
+            data = resp.json() if resp.content else {}
+            safes = data.get("safes") if isinstance(data, dict) else None
+            if not isinstance(safes, list):
+                results = data.get("results") if isinstance(data, dict) else None
+                if isinstance(results, list):
+                    safes = [r.get("address") for r in results if isinstance(r, dict)]
+                else:
+                    items = data.get("items") if isinstance(data, dict) else None
+                    if isinstance(items, list):
+                        safes = [i.get("address") for i in items if isinstance(i, dict)]
+                    else:
+                        safes = []
+            # Some gateway variants return object entries instead of plain strings.
+            normalized: List[str] = []
+            for s in safes:
+                if isinstance(s, str):
+                    sv = s.strip()
+                elif isinstance(s, dict):
+                    sv = str(s.get("address") or s.get("value") or "").strip()
+                else:
+                    sv = ""
+                if not sv or sv.lower() in seen:
+                    continue
+                seen.add(sv.lower())
+                normalized.append(sv)
+            if normalized:
+                found.extend(normalized)
+        except Exception:
+            return
+
+    def _lookup_for_chain(chain: int) -> List[str]:
+        nonlocal found, seen
+        found = []
+        seen = set()
+
+        # Fast path first: chain tx-service endpoints.
+        for host in _safe_tx_hosts_for_chain(chain)[:2]:
+            for u in [
+                f"{host}/api/v1/owners/{owner_norm}/safes/",
+                f"{host}/api/v1/safes/?owner={owner_norm}",
+            ]:
+                _collect_from_url(u)
+                if found:
+                    return found
+
+        # Secondary fallback: Safe Client Gateway patterns.
+        gateway = _safe_client_gateway_base().rstrip("/")
+        for u in [
+            f"{gateway}/v1/chains/{chain}/owners/{owner_norm}/safes",
+            f"{gateway}/v2/owners/{owner_norm}/safes?chainIds={chain}",
+            f"{gateway}/v2/owners/{owner_norm}/safes",
+            f"{gateway}/v1/owners/{owner_norm}/safes",
+        ]:
+            _collect_from_url(u)
+            if found:
+                return found
+        return []
+
+    checked: List[int] = []
+    for chain in [cid, 137, 1]:
+        if chain in checked:
+            continue
+        checked.append(chain)
+        got = _lookup_for_chain(chain)
+        if got:
+            return {
+                "owner": owner_norm,
+                "chain_id": cid,
+                "source_chain": chain,
+                "checked_chains": checked,
+                "safes": got,
+            }
+
+    return {
+        "owner": owner_norm,
+        "chain_id": cid,
+        "source_chain": None,
+        "checked_chains": checked,
+        "safes": [],
+    }
+
+
+@app.post("/api/user/trading-account")
+@app.patch("/api/user/trading-account")
+@app.put("/api/user/trading-account")
+def update_user_trading_account(payload: UserTradingAccountUpdate, user: User = Depends(get_current_user)):
+    db = _load_users()
+    acct = _upsert_user_trading_account(db, user.username)
+    _sync_account_enable_flags(acct)
+    privileged = _is_admin_or_founders_account(db, acct.get("name"))
+
+    if payload.clear_funder:
+        acct.pop("funder", None)
+        acct.pop("wallet_owner", None)
+        acct.pop("safe_address", None)
+    if payload.clear_private_key:
+        acct.pop("private_key", None)
+    if payload.auth_mode is not None:
+        acct["auth_mode"] = _normalize_auth_mode(payload.auth_mode)
+
+    if payload.enabled is not None:
+        acct["user_enabled"] = bool(payload.enabled)
+    if payload.priority is not None:
+        if not user.is_admin:
+            raise HTTPException(status_code=403, detail="Priority is admin-only")
+        acct["priority"] = int(payload.priority)
+    if payload.funder is not None:
+        acct["funder"] = _normalize_eth_address(payload.funder, "funder")
+    if payload.wallet_owner is not None:
+        acct["wallet_owner"] = _normalize_eth_address(payload.wallet_owner, "wallet_owner")
+    if payload.safe_address is not None:
+        acct["safe_address"] = _normalize_eth_address(payload.safe_address, "safe_address")
+    if _account_auth_mode(acct) != "private_key" and payload.wallet_owner is not None and payload.funder is not None:
+        if str(acct.get("wallet_owner", "")).lower() == str(acct.get("funder", "")).lower():
+            raise HTTPException(status_code=400, detail="Funder cannot be the same as wallet owner EOA. Connect/select a Safe.")
+
+    if payload.private_key is not None:
+        normalized_private_key = _normalize_private_key(payload.private_key)
+        private_key_address = Account.from_key(normalized_private_key).address
+        wallet_owner = acct.get("wallet_owner")
+        if isinstance(wallet_owner, str) and wallet_owner and wallet_owner.lower() != private_key_address.lower():
+            raise HTTPException(status_code=400, detail="Private key does not match the connected wallet owner")
+        acct["private_key"] = _encrypt_session_key(normalized_private_key)
+        acct["wallet_owner"] = private_key_address
+        if _account_auth_mode(acct) == "private_key":
+            acct["funder"] = private_key_address
+        acct["key_version"] = int(acct.get("key_version", 1) or 1) + 1
+
+    auth_mode = _account_auth_mode(acct)
+    if auth_mode == "private_key":
+        private_key_address = _private_key_address(acct.get("private_key"))
+        if private_key_address:
+            acct["funder"] = private_key_address
+            acct["wallet_owner"] = private_key_address
+        acct["signature_type"] = 0
+    else:
+        if payload.signature_type is not None and payload.signature_type != 2:
+            raise HTTPException(status_code=400, detail="signature_type is fixed to 2 for profile session-key updates")
+        acct["signature_type"] = 2
+
+    if payload.enabled is True:
+        if not bool(acct.get("admin_enabled", False)):
+            raise HTTPException(status_code=403, detail="Trading is disabled by admin for this account")
+        if auth_mode == "private_key":
+            if not _private_key_address(acct.get("private_key")):
+                raise HTTPException(status_code=400, detail="Private key is required before enabling private-key trading")
+        else:
+            trading_raw = acct.get("trading_session_key") or acct.get("session_key")
+            if not trading_raw:
+                raise HTTPException(status_code=400, detail="Trading session key is required before enabling trading")
+            if not privileged:
+                fee_raw = acct.get("fee_session_key") or acct.get("fees_session_key") or acct.get("fee_key")
+                if not fee_raw:
+                    raise HTTPException(status_code=400, detail="Fee session key is required before enabling trading")
+            if not acct.get("safe_address"):
+                raise HTTPException(status_code=400, detail="Safe is required before enabling trading")
+
+    now_iso = _utc_now_iso()
+    normalized_trading_key = None
+    if payload.trading_session_key is not None:
+        normalized_trading_key = _normalize_private_key(payload.trading_session_key)
+        funder_for_verify = acct.get("funder")
+        if not isinstance(funder_for_verify, str) or not funder_for_verify:
+            raise HTTPException(status_code=400, detail="Funder is required before setting trading session key")
+        ok, reason = _verify_trading_session_key_for_auth(normalized_trading_key, funder_for_verify, int(acct.get("signature_type", 2) or 2))
+        if not ok:
+            raise HTTPException(status_code=400, detail=f"Trading session key is not authorized for this funder/signature context ({reason})")
+        acct["trading_session_key"] = _encrypt_session_key(normalized_trading_key)
+        acct["trading_session_updated_at"] = now_iso
+        acct["trading_session_expires_at"] = (datetime.utcnow() + timedelta(days=30)).replace(microsecond=0).isoformat() + "Z"
+        acct["key_version"] = int(acct.get("key_version", 1) or 1) + 1
+        acct["trading_session_verified"] = True
+        acct["trading_session_verified_at"] = now_iso
+        acct["trading_session_verification_error"] = None
+
+    if payload.fee_session_key is not None:
+        normalized_fee_key = _normalize_private_key(payload.fee_session_key)
+        acct["fee_session_key"] = _encrypt_session_key(normalized_fee_key)
+        acct["fee_session_updated_at"] = now_iso
+        acct["fee_session_expires_at"] = (datetime.utcnow() + timedelta(days=30)).replace(microsecond=0).isoformat() + "Z"
+        acct["key_version"] = int(acct.get("key_version", 1) or 1) + 1
+
+    funder = acct.get("funder")
+    if auth_mode != "private_key" and isinstance(funder, str) and funder:
+        signer = _derive_signer_address(acct, normalized_trading_key)
+        if (not signer) or signer.lower() != funder.lower():
+            acct["signature_type"] = 2
+
+    _sync_account_enable_flags(acct)
+
+    _save_users(db)
+    out = _sanitize_trading_account(acct)
+    out["is_admin_or_founders"] = privileged
+    out["requires_fee_key"] = not privileged
+    return {"ok": True, "account": out}
+
+
+@app.post("/api/user/trading-account/session-keys/{key_type}/generate")
+def generate_user_trading_session_key(key_type: str, user: User = Depends(get_current_user)):
+    db = _load_users()
+    acct = _upsert_user_trading_account(db, user.username)
+
+    kind = (key_type or "").strip().lower()
+    if kind not in {"trading", "fee"}:
+        raise HTTPException(status_code=400, detail="type must be trading or fee")
+
+    now_iso = _utc_now_iso()
+    generated = _generate_private_key_hex()
+    if kind == "trading":
+        if not acct.get("safe_address"):
+            raise HTTPException(status_code=400, detail="Safe is required before setting trading session key")
+        funder_for_verify = acct.get("funder")
+        if not isinstance(funder_for_verify, str) or not funder_for_verify:
+            raise HTTPException(status_code=400, detail="Funder is required before setting trading session key")
+        ok, reason = _verify_trading_session_key_for_auth(generated, funder_for_verify, int(acct.get("signature_type", 2) or 2))
+        if not ok:
+            raise HTTPException(status_code=400, detail=f"Generated trading key is not authorized for this funder/signature context ({reason})")
+        acct["trading_session_key"] = _encrypt_session_key(generated)
+        acct["trading_session_updated_at"] = now_iso
+        acct["trading_session_expires_at"] = (datetime.utcnow() + timedelta(days=30)).replace(microsecond=0).isoformat() + "Z"
+        acct["trading_session_verified"] = True
+        acct["trading_session_verified_at"] = now_iso
+        acct["trading_session_verification_error"] = None
+    else:
+        acct["fee_session_key"] = _encrypt_session_key(generated)
+        acct["fee_session_updated_at"] = now_iso
+        acct["fee_session_expires_at"] = (datetime.utcnow() + timedelta(days=30)).replace(microsecond=0).isoformat() + "Z"
+
+    acct["key_version"] = int(acct.get("key_version", 1) or 1) + 1
+    _save_users(db)
+    return {"ok": True, "account": _sanitize_trading_account(acct)}
+
+
+@app.delete("/api/user/trading-account/session-keys/{key_type}")
+def clear_user_trading_session_key(key_type: str, user: User = Depends(get_current_user)):
+    db = _load_users()
+    acct = _upsert_user_trading_account(db, user.username)
+
+    kind = (key_type or "").strip().lower()
+    if kind not in {"trading", "fee"}:
+        raise HTTPException(status_code=400, detail="type must be trading or fee")
+
+    if kind == "trading":
+        acct.pop("trading_session_key", None)
+        acct.pop("session_key", None)
+        acct["trading_session_updated_at"] = _utc_now_iso()
+        acct["trading_session_expires_at"] = None
+        acct["trading_session_verified"] = False
+        acct["trading_session_verified_at"] = None
+        acct["trading_session_verification_error"] = None
+    else:
+        acct.pop("fee_session_key", None)
+        acct.pop("fees_session_key", None)
+        acct.pop("fee_key", None)
+        acct["fee_session_updated_at"] = _utc_now_iso()
+        acct["fee_session_expires_at"] = None
+
+    acct["key_version"] = int(acct.get("key_version", 1) or 1) + 1
+    _save_users(db)
+    return {"ok": True, "account": _sanitize_trading_account(acct)}
+
+
 @app.delete("/api/user/delete")
 def delete_user(user: User = Depends(get_current_user), token: str = Depends(oauth2_scheme)):
     """Delete the current user's account (non-admin only)."""
@@ -805,6 +1823,370 @@ def delete_user(user: User = Depends(get_current_user), token: str = Depends(oau
         _save_tokens_file(TOKENS)
     
     return {"ok": True, "message": "Account deleted successfully"}
+
+
+@app.get("/api/trading/accounts")
+def list_trading_accounts(user: User = Depends(require_admin)):
+    db = _load_users()
+    accounts = _trading_accounts_ref(db)
+
+    # Ensure every known account/user appears in admin trading list, even if
+    # no funder/session keys are configured yet.
+    existing_names = {str((a or {}).get("name") or "").strip() for a in accounts}
+    existing_names.discard("")
+    all_names = set(existing_names)
+
+    for uname in db.keys():
+        if isinstance(uname, str) and uname and not uname.startswith("_"):
+            all_names.add(uname)
+    for d in STATE.iterdir():
+        if not d.is_dir():
+            continue
+        name = d.name
+        if name.lower() in {"chart_cache"} or name.startswith(".") or name.startswith("_"):
+            continue
+        all_names.add(name)
+
+    changed = False
+    for name in sorted(all_names, key=lambda s: s.lower()):
+        if name not in existing_names:
+            _upsert_user_trading_account(db, name)
+            changed = True
+
+    if changed:
+        _save_users(db)
+        accounts = _trading_accounts_ref(db)
+
+    ordered = sorted(accounts, key=lambda a: int((a or {}).get("priority", 0) or 0), reverse=True)
+    out = []
+    for a in ordered:
+        row = _sanitize_trading_account(a)
+        privileged = _is_admin_or_founders_account(db, a.get("name"))
+        row["is_admin_or_founders"] = privileged
+        row["requires_fee_key"] = not privileged
+        user_row = db.get(str(a.get("name") or ""))
+        row["has_user_record"] = isinstance(user_row, dict)
+        row["is_admin"] = bool(isinstance(user_row, dict) and user_row.get("is_admin", False))
+        out.append(row)
+    return {"accounts": out}
+
+
+@app.post("/api/trading/accounts")
+def create_trading_account(payload: TradingAccountCreate, user: User = Depends(require_admin)):
+    db = _load_users()
+    accounts = _trading_accounts_ref(db)
+
+    name = str(payload.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name is required")
+    if _find_trading_account(accounts, name):
+        raise HTTPException(status_code=409, detail="Account already exists")
+
+    auth_mode = _normalize_auth_mode(payload.auth_mode)
+    funder = _normalize_eth_address(payload.funder, "funder")
+    priority = int(payload.priority)
+    signature_type = payload.signature_type
+    if signature_type is not None and signature_type not in (0, 1, 2):
+        raise HTTPException(status_code=400, detail="signature_type must be one of 0, 1, 2")
+
+    now_iso = _utc_now_iso()
+    acct = {
+        "name": name,
+        "enabled": False,
+        "user_enabled": False,
+        "admin_enabled": bool(payload.enabled),
+        "priority": priority,
+        "funder": funder,
+        "auth_mode": auth_mode,
+    }
+    if payload.wallet_owner:
+        acct["wallet_owner"] = _normalize_eth_address(payload.wallet_owner, "wallet_owner")
+    if payload.safe_address:
+        acct["safe_address"] = _normalize_eth_address(payload.safe_address, "safe_address")
+
+    normalized_private_key = None
+    if payload.private_key:
+        normalized_private_key = _normalize_private_key(payload.private_key)
+        private_key_address = Account.from_key(normalized_private_key).address
+        if auth_mode == "private_key":
+            funder = private_key_address
+            acct["funder"] = private_key_address
+            acct["wallet_owner"] = private_key_address
+            signature_type = 0
+        acct["private_key"] = _encrypt_session_key(normalized_private_key)
+
+    normalized_trading_key = None
+    if payload.trading_session_key:
+        normalized_trading_key = _normalize_private_key(payload.trading_session_key)
+        sig_for_verify = signature_type if signature_type is not None else 2
+        ok, reason = _verify_trading_session_key_for_auth(normalized_trading_key, funder, int(sig_for_verify))
+        if not ok:
+            raise HTTPException(status_code=400, detail=f"Trading session key is not authorized for this funder/signature context ({reason})")
+        acct["trading_session_key"] = _encrypt_session_key(normalized_trading_key)
+        acct["trading_session_updated_at"] = now_iso
+        acct["trading_session_expires_at"] = (datetime.utcnow() + timedelta(days=30)).replace(microsecond=0).isoformat() + "Z"
+        acct["trading_session_verified"] = True
+        acct["trading_session_verified_at"] = now_iso
+        acct["trading_session_verification_error"] = None
+
+    if payload.fee_session_key:
+        normalized_fee_key = _normalize_private_key(payload.fee_session_key)
+        acct["fee_session_key"] = _encrypt_session_key(normalized_fee_key)
+        acct["fee_session_updated_at"] = now_iso
+        acct["fee_session_expires_at"] = (datetime.utcnow() + timedelta(days=30)).replace(microsecond=0).isoformat() + "Z"
+
+    if auth_mode == "private_key":
+        if payload.enabled and not normalized_private_key:
+            raise HTTPException(status_code=400, detail="Private key is required when auth_mode is private_key")
+        signature_type = 0
+    elif signature_type is None:
+        signer = _derive_signer_address({}, normalized_trading_key)
+        if (not signer) or signer.lower() != funder.lower():
+            signature_type = 2
+        else:
+            signature_type = 0
+    acct["signature_type"] = signature_type
+    acct["key_version"] = 1
+    _sync_account_enable_flags(acct)
+
+    accounts.append(acct)
+    _save_users(db)
+    out = _sanitize_trading_account(acct)
+    privileged = _is_admin_or_founders_account(db, acct.get("name"))
+    out["is_admin_or_founders"] = privileged
+    out["requires_fee_key"] = not privileged
+    return {"ok": True, "account": out}
+
+
+@app.patch("/api/trading/accounts/{name}")
+def patch_trading_account(name: str, payload: TradingAccountPatch, user: User = Depends(require_admin)):
+    db = _load_users()
+    accounts = _trading_accounts_ref(db)
+    acct = _find_trading_account(accounts, name)
+    if not acct:
+        raise HTTPException(status_code=404, detail="Account not found")
+    _sync_account_enable_flags(acct)
+
+    now_iso = _utc_now_iso()
+    if payload.enabled is not None:
+        acct["admin_enabled"] = bool(payload.enabled)
+    if payload.priority is not None:
+        acct["priority"] = int(payload.priority)
+    if payload.funder is not None:
+        acct["funder"] = _normalize_eth_address(payload.funder, "funder")
+    if payload.wallet_owner is not None:
+        acct["wallet_owner"] = _normalize_eth_address(payload.wallet_owner, "wallet_owner")
+    if payload.safe_address is not None:
+        acct["safe_address"] = _normalize_eth_address(payload.safe_address, "safe_address")
+    if payload.clear_funder:
+        acct.pop("funder", None)
+        acct.pop("wallet_owner", None)
+        acct.pop("safe_address", None)
+    if payload.clear_private_key:
+        acct.pop("private_key", None)
+    if payload.auth_mode is not None:
+        acct["auth_mode"] = _normalize_auth_mode(payload.auth_mode)
+    if payload.signature_type is not None:
+        if payload.signature_type not in (0, 1, 2):
+            raise HTTPException(status_code=400, detail="signature_type must be one of 0, 1, 2")
+        acct["signature_type"] = payload.signature_type
+    if payload.is_admin is not None:
+        target = db.get(name)
+        if not isinstance(target, dict):
+            raise HTTPException(status_code=400, detail="Cannot change admin role: no user record for this account")
+        target["is_admin"] = bool(payload.is_admin)
+        # Update active token claims so role changes apply immediately.
+        changed = False
+        for t, info in TOKENS.items():
+            if str(info.get("username", "")) == str(name):
+                info["is_admin"] = bool(payload.is_admin)
+                changed = True
+        if changed:
+            _save_tokens_file(TOKENS)
+
+    if payload.private_key is not None:
+        normalized_private_key = _normalize_private_key(payload.private_key)
+        private_key_address = Account.from_key(normalized_private_key).address
+        acct["private_key"] = _encrypt_session_key(normalized_private_key)
+        if _account_auth_mode(acct) == "private_key":
+            acct["funder"] = private_key_address
+            acct["wallet_owner"] = private_key_address
+            acct["signature_type"] = 0
+        acct["key_version"] = int(acct.get("key_version", 1) or 1) + 1
+
+    if _account_auth_mode(acct) == "private_key":
+        private_key_address = _private_key_address(acct.get("private_key"))
+        if private_key_address:
+            acct["funder"] = private_key_address
+            acct["wallet_owner"] = private_key_address
+        acct["signature_type"] = 0
+
+    normalized_trading_key = None
+    if payload.trading_session_key is not None:
+        normalized_trading_key = _normalize_private_key(payload.trading_session_key)
+        funder_for_verify = acct.get("funder")
+        if not isinstance(funder_for_verify, str) or not funder_for_verify:
+            raise HTTPException(status_code=400, detail="Funder is required before setting trading session key")
+        sig_for_verify = int(acct.get("signature_type", 0) or 0)
+        ok, reason = _verify_trading_session_key_for_auth(normalized_trading_key, funder_for_verify, sig_for_verify)
+        if not ok:
+            raise HTTPException(status_code=400, detail=f"Trading session key is not authorized for this funder/signature context ({reason})")
+        acct["trading_session_key"] = _encrypt_session_key(normalized_trading_key)
+        acct["trading_session_updated_at"] = now_iso
+        acct["trading_session_expires_at"] = (datetime.utcnow() + timedelta(days=30)).replace(microsecond=0).isoformat() + "Z"
+        acct["key_version"] = int(acct.get("key_version", 1) or 1) + 1
+        acct["trading_session_verified"] = True
+        acct["trading_session_verified_at"] = now_iso
+        acct["trading_session_verification_error"] = None
+
+    if payload.fee_session_key is not None:
+        normalized_fee_key = _normalize_private_key(payload.fee_session_key)
+        acct["fee_session_key"] = _encrypt_session_key(normalized_fee_key)
+        acct["fee_session_updated_at"] = now_iso
+        acct["fee_session_expires_at"] = (datetime.utcnow() + timedelta(days=30)).replace(microsecond=0).isoformat() + "Z"
+        acct["key_version"] = int(acct.get("key_version", 1) or 1) + 1
+
+    if _account_auth_mode(acct) != "private_key" and payload.signature_type is None and payload.funder is not None:
+        signer = _derive_signer_address(acct, normalized_trading_key)
+        funder = acct.get("funder")
+        if signer and isinstance(funder, str) and signer.lower() != funder.lower():
+            acct["signature_type"] = 2
+
+    _sync_account_enable_flags(acct)
+
+    _save_users(db)
+    out = _sanitize_trading_account(acct)
+    privileged = _is_admin_or_founders_account(db, acct.get("name"))
+    out["is_admin_or_founders"] = privileged
+    out["requires_fee_key"] = not privileged
+    user_row = db.get(str(acct.get("name") or ""))
+    out["has_user_record"] = isinstance(user_row, dict)
+    out["is_admin"] = bool(isinstance(user_row, dict) and user_row.get("is_admin", False))
+    return {"ok": True, "account": out}
+
+
+@app.delete("/api/trading/accounts/{name}/session-keys/{key_type}")
+def delete_trading_session_key(name: str, key_type: str, user: User = Depends(require_admin)):
+    db = _load_users()
+    accounts = _trading_accounts_ref(db)
+    acct = _find_trading_account(accounts, name)
+    if not acct:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    key_type_norm = (key_type or "").strip().lower()
+    if key_type_norm not in {"trading", "fee"}:
+        raise HTTPException(status_code=400, detail="type must be trading or fee")
+
+    if key_type_norm == "trading":
+        acct.pop("trading_session_key", None)
+        acct.pop("session_key", None)
+        acct["trading_session_updated_at"] = _utc_now_iso()
+        acct["trading_session_expires_at"] = None
+        acct["trading_session_verified"] = False
+        acct["trading_session_verified_at"] = None
+        acct["trading_session_verification_error"] = None
+    else:
+        acct.pop("fee_session_key", None)
+        acct.pop("fees_session_key", None)
+        acct.pop("fee_key", None)
+        acct["fee_session_updated_at"] = _utc_now_iso()
+        acct["fee_session_expires_at"] = None
+
+    acct["key_version"] = int(acct.get("key_version", 1) or 1) + 1
+    _save_users(db)
+    return {"ok": True, "account": _sanitize_trading_account(acct)}
+
+
+@app.delete("/api/trading/accounts/{name}")
+def delete_trading_account(name: str, user: User = Depends(require_admin)):
+    db = _load_users()
+    accounts = _trading_accounts_ref(db)
+    acct = _find_trading_account(accounts, name)
+    if not acct:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    # Keep at least one trading account configured.
+    if len(accounts) <= 1:
+        raise HTTPException(status_code=400, detail="Cannot delete the last trading account")
+
+    accounts[:] = [a for a in accounts if str(a.get("name")) != name]
+
+    # If the trading account maps to a user record, remove that user as well.
+    if name in db and isinstance(db.get(name), dict) and not str(name).startswith("_"):
+        db.pop(name, None)
+        # Revoke active tokens for the deleted username.
+        stale = [t for t, info in TOKENS.items() if str(info.get("username", "")) == str(name)]
+        for t in stale:
+            TOKENS.pop(t, None)
+        _save_tokens_file(TOKENS)
+
+    _save_users(db)
+    return {"ok": True, "deleted": name}
+
+
+@app.post("/api/trading/accounts/{name}/session-keys/{key_type}/generate")
+def generate_trading_session_key(name: str, key_type: str, user: User = Depends(require_admin)):
+    db = _load_users()
+    accounts = _trading_accounts_ref(db)
+    acct = _find_trading_account(accounts, name)
+    if not acct:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    key_type_norm = (key_type or "").strip().lower()
+    if key_type_norm not in {"trading", "fee"}:
+        raise HTTPException(status_code=400, detail="type must be trading or fee")
+
+    now_iso = _utc_now_iso()
+    generated = _generate_private_key_hex()
+    if key_type_norm == "trading":
+        funder_for_verify = acct.get("funder")
+        if not isinstance(funder_for_verify, str) or not funder_for_verify:
+            raise HTTPException(status_code=400, detail="Funder is required before setting trading session key")
+        sig_for_verify = int(acct.get("signature_type", 0) or 0)
+        ok, reason = _verify_trading_session_key_for_auth(generated, funder_for_verify, sig_for_verify)
+        if not ok:
+            raise HTTPException(status_code=400, detail=f"Generated trading key is not authorized for this funder/signature context ({reason})")
+        acct["trading_session_key"] = _encrypt_session_key(generated)
+        acct["trading_session_updated_at"] = now_iso
+        acct["trading_session_expires_at"] = (datetime.utcnow() + timedelta(days=30)).replace(microsecond=0).isoformat() + "Z"
+        acct["trading_session_verified"] = True
+        acct["trading_session_verified_at"] = now_iso
+        acct["trading_session_verification_error"] = None
+    else:
+        acct["fee_session_key"] = _encrypt_session_key(generated)
+        acct["fee_session_updated_at"] = now_iso
+        acct["fee_session_expires_at"] = (datetime.utcnow() + timedelta(days=30)).replace(microsecond=0).isoformat() + "Z"
+
+    acct["key_version"] = int(acct.get("key_version", 1) or 1) + 1
+    _save_users(db)
+    return {"ok": True, "account": _sanitize_trading_account(acct)}
+
+
+@app.post("/api/trading/accounts/reorder")
+def reorder_trading_accounts(payload: TradingReorderRequest, user: User = Depends(require_admin)):
+    db = _load_users()
+    accounts = _trading_accounts_ref(db)
+    names = [str(a.get("name")) for a in accounts if isinstance(a, dict)]
+    name_set = set(names)
+
+    ordered = payload.ordered_names or []
+    if len(set(ordered)) != len(ordered):
+        raise HTTPException(status_code=400, detail="ordered_names must be unique")
+    missing = [n for n in ordered if n not in name_set]
+    if missing:
+        raise HTTPException(status_code=404, detail=f"Unknown accounts in ordered_names: {', '.join(missing)}")
+
+    ranked = list(ordered)
+    tail = [n for n in names if n not in set(ordered)]
+    ranked.extend(tail)
+
+    base = len(ranked) * 10
+    by_name = {str(a.get("name")): a for a in accounts}
+    for idx, n in enumerate(ranked):
+        by_name[n]["priority"] = base - (idx * 10)
+
+    _save_users(db)
+    return {"ok": True, "accounts": [_sanitize_trading_account(by_name[n]) for n in ranked]}
 
 
 @app.get("/api/trades/all")
@@ -856,8 +2238,8 @@ def _parse_hist_csv(target_date: datetime):
                 except Exception:
                     continue
                 
-                # Check if this timestamp is for our target date
-                if dt.date() != target_date.date():
+                # Check if this timestamp belongs to the target market date
+                if _market_date_for_ts(dt) != target_date.date():
                     continue
                 
                 # Parse up and down probabilities
@@ -904,6 +2286,14 @@ def _append_price_row(ts_iso: str, up: float, down: float):
         pass
 
 
+def _market_date_for_ts(dt: datetime):
+    """Return the market date a timestamp belongs to, using the noon ET roll."""
+    et = dt.astimezone(ET)
+    if et.hour < 12:
+        return et.date()
+    return (et + timedelta(days=1)).date()
+
+
 def _parse_price_log_for_day(target_date: datetime):
     out = []
     if not PRICE_LOG.exists():
@@ -920,9 +2310,10 @@ def _parse_price_log_for_day(target_date: datetime):
                 except Exception:
                     try:
                         dt = datetime.utcfromtimestamp(float(ts_txt))
+                        dt = dt.replace(tzinfo=timezone.utc)
                     except Exception:
                         continue
-                if dt.date() != target_date.date():
+                if _market_date_for_ts(dt) != target_date.date():
                     continue
                 try:
                     upf = float(row.get("up") or "")
@@ -933,6 +2324,9 @@ def _parse_price_log_for_day(target_date: datetime):
                 except Exception:
                     dnf = None
                 if upf is None and dnf is None:
+                    continue
+                # Skip synthetic/missing rows recorded as 0/0.
+                if upf == 0.0 and dnf == 0.0:
                     continue
                 ts_out = dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
                 out.append({"ts": ts_out, "up": upf, "down": dnf})
@@ -1026,11 +2420,7 @@ def _merge_day_points(target_date: datetime):
     # From our own recorder
     log_points = _parse_price_log_for_day(target_date)
     points.extend(log_points)
-    
-    # If no real data found, generate synthetic data for testing
-    if not points:
-        points = _generate_synthetic_day_data(target_date)
-    
+
     # Dedup by ts (prefer later entries by sorting)
     by_ts = {}
     for p in sorted(points, key=lambda x: x["ts"]) :  # type: ignore
@@ -1040,13 +2430,210 @@ def _merge_day_points(target_date: datetime):
     return out
 
 
+def _normalize_probability(v: Any) -> Optional[float]:
+    try:
+        n = float(v)
+    except Exception:
+        return None
+    if n > 1:
+        n = n / 100.0
+    if not (0.0 <= n <= 1.0):
+        return None
+    return n
+
+
+def _safe_mid_price(token_id: Optional[str]) -> Optional[float]:
+    if not token_id:
+        return None
+    try:
+        bid = clob_price(token_id, "sell")
+    except Exception:
+        bid = None
+    try:
+        ask = clob_price(token_id, "buy")
+    except Exception:
+        ask = None
+    try:
+        bid = float(bid) if bid is not None else None
+    except Exception:
+        bid = None
+    try:
+        ask = float(ask) if ask is not None else None
+    except Exception:
+        ask = None
+    if (bid is not None) and (ask is not None):
+        return (bid + ask) / 2.0
+    if ask is not None:
+        return ask
+    if bid is not None:
+        return bid
+    return None
+
+
+def _market_window_utc_for_date(target_date: datetime) -> tuple[datetime, datetime]:
+    """Return UTC bounds for one market day using noon ET roll."""
+    d = target_date.date()
+    noon_target = datetime(d.year, d.month, d.day, 12, 0, 0)
+    noon_prev = noon_target - timedelta(days=1)
+    if hasattr(ET, "localize"):
+        start_et = ET.localize(noon_prev)
+        end_et = ET.localize(noon_target)
+    else:
+        start_et = noon_prev.replace(tzinfo=ET)
+        end_et = noon_target.replace(tzinfo=ET)
+    start_utc = start_et.astimezone(timezone.utc)
+    end_utc = end_et.astimezone(timezone.utc)
+    if d == _active_market_date():
+        now_utc = datetime.now(timezone.utc)
+        if now_utc < end_utc:
+            end_utc = now_utc
+    return start_utc, end_utc
+
+
+def _fetch_clob_up_history_for_day(target_date: datetime) -> List[Dict[str, Any]]:
+    """Fetch UP token historical prices from CLOB and map to local point format."""
+    up_id, _dn_id, _market = _resolve_market_for_date(target_date.date())
+    if not up_id:
+        return []
+    start_utc, end_utc = _market_window_utc_for_date(target_date)
+    start_ts = int(start_utc.timestamp())
+    end_ts = int(end_utc.timestamp())
+    if end_ts <= start_ts:
+        return []
+
+    headers = {"Accept": "application/json", "User-Agent": _yahoo_user_agent()}
+    history: List[Any] = []
+    try:
+        # Dense intraday series (close to the old minute-by-minute feel).
+        resp = requests.get(
+            f"{_clob_api_base().rstrip('/')}/prices-history",
+            params={
+                "market": up_id,
+                "interval": "1d",
+                "fidelity": 1,
+            },
+            timeout=7.5,
+            headers=headers,
+        )
+        if resp.status_code == 200:
+            payload = resp.json() if resp.content else {}
+            history = payload.get("history", []) if isinstance(payload, dict) else []
+            if not isinstance(history, list):
+                history = []
+    except Exception:
+        history = []
+
+    # Fallback for endpoint filter quirks: request full market history and clip locally.
+    if len(history) < 5:
+        try:
+            resp2 = requests.get(
+                f"{_clob_api_base().rstrip('/')}/prices-history",
+                params={"market": up_id, "startTs": start_ts, "endTs": end_ts, "interval": "1m", "fidelity": 10},
+                timeout=7.5,
+                headers=headers,
+            )
+            if resp2.status_code == 200:
+                payload2 = resp2.json() if resp2.content else {}
+                h2 = payload2.get("history", []) if isinstance(payload2, dict) else []
+                if isinstance(h2, list) and len(h2) > len(history):
+                    history = h2
+        except Exception:
+            pass
+
+    if len(history) < 5:
+        try:
+            resp3 = requests.get(
+                f"{_clob_api_base().rstrip('/')}/prices-history",
+                params={"market": up_id, "interval": "max", "fidelity": 1},
+                timeout=7.5,
+                headers=headers,
+            )
+            if resp3.status_code == 200:
+                payload3 = resp3.json() if resp3.content else {}
+                h3 = payload3.get("history", []) if isinstance(payload3, dict) else []
+                if isinstance(h3, list) and len(h3) > len(history):
+                    history = h3
+        except Exception:
+            pass
+
+    out: List[Dict[str, Any]] = []
+    for row in history:
+        if not isinstance(row, dict):
+            continue
+        t_raw = row.get("t")
+        p_raw = row.get("p")
+        up = _normalize_probability(p_raw)
+        if up is None:
+            continue
+        try:
+            t_num = float(t_raw)
+        except Exception:
+            continue
+        # API may return seconds or milliseconds.
+        if t_num > 1e12:
+            t_num = t_num / 1000.0
+        try:
+            dt = datetime.fromtimestamp(t_num, tz=timezone.utc)
+        except Exception:
+            continue
+        if dt < start_utc or dt > (end_utc + timedelta(minutes=1)):
+            continue
+        out.append({
+            "ts": dt.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            "up": up,
+            "down": 1.0 - up,
+        })
+    out.sort(key=lambda x: x["ts"])
+    return out
+
+
 @app.get("/api/prices/day")
 def prices_for_day(date: str, user: User = Depends(get_current_user)):
     try:
         d = datetime.fromisoformat(date)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
-    points = _merge_day_points(d)
+    clob_points = _fetch_clob_up_history_for_day(d)
+    local_points = _merge_day_points(d)
+    # Prefer authoritative CLOB history; only blend local tail points that are valid.
+    points: List[Dict[str, Any]] = []
+    if clob_points:
+        points.extend(clob_points)
+        latest_clob_ts = clob_points[-1]["ts"]
+        for p in local_points:
+            ts = str(p.get("ts") or "").strip()
+            if not ts or ts <= latest_clob_ts:
+                continue
+            up = _normalize_probability(p.get("up"))
+            down = _normalize_probability(p.get("down"))
+            if up is None and down is not None:
+                up = 1.0 - down
+            if down is None and up is not None:
+                down = 1.0 - up
+            if up is None or down is None:
+                continue
+            # Discard clearly synthetic missing-data rows.
+            if up == 0.0 and down == 0.0:
+                continue
+            points.append({"ts": ts, "up": up, "down": down})
+    else:
+        points = local_points
+
+    by_ts: Dict[str, Dict[str, Any]] = {}
+    for p in points:
+        ts = str(p.get("ts") or "").strip()
+        if not ts:
+            continue
+        up = _normalize_probability(p.get("up"))
+        down = _normalize_probability(p.get("down"))
+        if up is None and down is not None:
+            up = 1.0 - down
+        if down is None and up is not None:
+            down = 1.0 - up
+        if up is None or down is None:
+            continue
+        by_ts[ts] = {"ts": ts, "up": up, "down": down}
+    points = sorted(by_ts.values(), key=lambda x: x["ts"])
     return {"date": d.date().isoformat(), "points": points}
 
 
@@ -1071,33 +2658,8 @@ def _read_jsonl(path: Path, limit: int = 1000):
     return out[-limit:]
 
 def _is_valid_trade(record):
-    """Check if a trade record represents an actual executed trade"""
-    resp = record.get("resp", {})
-    
-    # Skip dry run trades
-    if resp.get("dry_run", False):
-        return False
-    
-    # For orders, check if they were actually filled/matched
-    if "orderID" in resp:
-        status = resp.get("status", "").lower()
-        # Only include trades that were matched/filled or explicitly marked as filled
-        if status in ["matched", "filled"] or record.get("status") == "filled":
-            return True
-        # Skip live orders that may not have been filled
-        if status == "live":
-            return False
-    
-    # For redemptions, always include them
-    if record.get("event", "").upper() == "REDEEM":
-        return True
-    
-    # For older records without detailed status, be more lenient
-    # but still exclude obvious dry runs
-    if not resp or "dry_run" not in resp:
-        return True
-    
-    return False
+    """Return only canonical confirmed fills (plus redemptions)."""
+    return is_confirmed_trade_record(record)
 
 
 @app.get("/api/accounts")
@@ -1138,6 +2700,8 @@ def account_trades(name: str, user: User = Depends(get_current_user)):
 def _active_market_date():
     now = now_et()
     anchor_et = now.astimezone(ET) if now.tzinfo else ET.localize(now)
+    # Market rolls at 12:00 PM ET (noon): before noon uses today's market,
+    # at/after noon uses next day's market.
     return (anchor_et.date() if anchor_et.hour < 12 else (anchor_et + timedelta(days=1)).date())
 
 
@@ -1154,7 +2718,7 @@ async def polymarket_chart_image(slug: Optional[str] = None, w: int = 1000, h: i
     try:
         if not slug:
             d = _active_market_date()
-            _up, _dn, market = resolve_bitcoin_updown_token_ids_for_date(d)
+            _up, _dn, market = _resolve_market_for_date(d)
             slug = (market or {}).get("slug")
         if not slug:
             raise HTTPException(status_code=404, detail="No market slug available")
@@ -1241,19 +2805,187 @@ async def polymarket_chart_image(slug: Optional[str] = None, w: int = 1000, h: i
 
 
 @app.get("/api/active-market")
-def active_market(user: User = Depends(get_current_user)):
+def active_market():
     d = _active_market_date()
-    up_id, dn_id, market = resolve_bitcoin_updown_token_ids_for_date(d)
+    up_id, dn_id, market = _resolve_market_for_date(d)
     return {"date": d.isoformat(), "up_id": up_id, "down_id": dn_id, "market": market}
+
+
+@app.get("/api/yahoo/prediction-market")
+def yahoo_prediction_market(slug: Optional[str] = None):
+    try:
+        d = None
+        if not slug:
+            d = _active_market_date()
+            _, _, market = _resolve_market_for_date(d)
+            slug = str((market or {}).get("slug") or "").strip()
+        if not slug:
+            raise HTTPException(status_code=404, detail="Active market slug unavailable")
+
+        # Yahoo Finance appends the year to the slug (e.g. "bitcoin-up-or-down-on-march-30-2026")
+        if d is None:
+            d = _active_market_date()
+        year = str(d.year)
+        yahoo_slug = slug if slug.endswith(f"-{year}") else f"{slug}-{year}"
+
+        session = requests.Session()
+        crumb = _yahoo_get_crumb(session)
+        if not crumb:
+            raise HTTPException(status_code=502, detail="Yahoo crumb fetch failed")
+
+        hosts = [
+            "https://query1.finance.yahoo.com",
+            "https://query2.finance.yahoo.com",
+        ]
+        # Yahoo moved this API path from /prediction/event to /prediction-market/event.
+        # Keep legacy fallback for resiliency in case one host lags.
+        endpoint_paths = [
+            "/v1/finance/prediction-market/event/{slug}",
+            "/v1/finance/prediction/event/{slug}",
+        ]
+        last_status = None
+        for base in hosts:
+            for endpoint in endpoint_paths:
+                url = f"{base}{endpoint.format(slug=yahoo_slug)}"
+                params = {
+                    "slug": yahoo_slug,
+                    "lang": "en-US",
+                    "region": "US",
+                    "crumb": crumb,
+                }
+                resp = session.get(
+                    url,
+                    params=params,
+                    timeout=4.5,
+                    headers={"Accept": "application/json", "User-Agent": _yahoo_user_agent()},
+                )
+                last_status = resp.status_code
+                if resp.status_code == 200:
+                    payload = resp.json() if resp.content else {}
+                    return {"ok": True, "slug": slug, "yahoo_slug": yahoo_slug, "payload": payload}
+                # If crumb expired/invalid, refresh once and retry this endpoint.
+                if resp.status_code == 401:
+                    YAHOO_CRUMB_CACHE["crumb"] = None
+                    refreshed = _yahoo_get_crumb(session)
+                    if refreshed:
+                        params["crumb"] = refreshed
+                        resp2 = session.get(
+                            url,
+                            params=params,
+                            timeout=4.5,
+                            headers={"Accept": "application/json", "User-Agent": _yahoo_user_agent()},
+                        )
+                        last_status = resp2.status_code
+                        if resp2.status_code == 200:
+                            payload = resp2.json() if resp2.content else {}
+                            return {"ok": True, "slug": slug, "yahoo_slug": yahoo_slug, "payload": payload}
+        raise HTTPException(status_code=502, detail=f"Yahoo event unavailable ({last_status})")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Yahoo event fetch failed: {e}")
+
+
+def _parse_json_array_maybe(value):
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, list):
+                return parsed
+        except Exception:
+            return None
+    return None
+
+
+def _gamma_current_from_market(market: dict) -> Optional[Dict[str, Any]]:
+    outcomes = _parse_json_array_maybe(market.get("outcomes")) or []
+    prices = _parse_json_array_maybe(market.get("outcomePrices")) or []
+    if len(prices) >= 2:
+        labels = [str(x or "").strip().lower() for x in outcomes]
+        up_idx = next((i for i, s in enumerate(labels) if "up" in s), 0)
+        down_idx = 1 if up_idx == 0 else 0
+        try:
+            up = float(prices[up_idx])
+            down = float(prices[down_idx])
+            if up > 1:
+                up /= 100.0
+            if down > 1:
+                down /= 100.0
+            return {"up": {"mid": up}, "down": {"mid": down}}
+        except Exception:
+            pass
+
+    # Fallback: approximate from bestBid/bestAsk/lastTradePrice for UP side.
+    bid = market.get("bestBid")
+    ask = market.get("bestAsk")
+    last = market.get("lastTradePrice")
+    try:
+        bid = float(bid) if bid is not None else None
+    except Exception:
+        bid = None
+    try:
+        ask = float(ask) if ask is not None else None
+    except Exception:
+        ask = None
+    try:
+        last = float(last) if last is not None else None
+    except Exception:
+        last = None
+
+    mid = (bid + ask) / 2.0 if (bid is not None and ask is not None) else (last if last is not None else (ask if ask is not None else bid))
+    if mid is None:
+        return None
+    if mid > 1:
+        mid /= 100.0
+    down = 1.0 - mid
+    return {"up": {"mid": mid}, "down": {"mid": down}}
+
+
+@app.get("/api/polymarket/current-by-slug")
+def polymarket_current_by_slug(slug: str, user: User = Depends(get_current_user)):
+    slug = str(slug or "").strip()
+    if not slug:
+        raise HTTPException(status_code=400, detail="Missing slug")
+    try:
+        base = "https://gamma-api.polymarket.com"
+        headers = {"Accept": "application/json", "User-Agent": _yahoo_user_agent()}
+        # Most reliable for pricing snapshot.
+        mr = requests.get(f"{base}/markets", params={"slug": slug}, timeout=6.5, headers=headers)
+        if mr.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"Gamma markets fetch failed ({mr.status_code})")
+        payload = mr.json() if mr.content else []
+        markets = payload if isinstance(payload, list) else payload.get("data", [])
+        if not isinstance(markets, list) or not markets:
+            raise HTTPException(status_code=404, detail="Gamma market not found for slug")
+        market = markets[0] if isinstance(markets[0], dict) else {}
+        cur = _gamma_current_from_market(market)
+        if not cur:
+            raise HTTPException(status_code=502, detail="Gamma market missing current price fields")
+        return {"ok": True, "slug": slug, "current": cur, "market": market}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Gamma current fetch failed: {e}")
 
 
 @app.get("/api/prices/current")
 def current_prices(user: User = Depends(get_current_user)):
+    now = time.time()
+    if _CURRENT_PRICES_CACHE["data"] is not None and now - _CURRENT_PRICES_CACHE["ts"] < _CURRENT_PRICES_TTL:
+        return _CURRENT_PRICES_CACHE["data"]
     d = _active_market_date()
-    up_id, dn_id, market = resolve_bitcoin_updown_token_ids_for_date(d)
+    up_id, dn_id, market = _resolve_market_for_date(d)
     def _px(tid):
-        bid = clob_price(tid, "sell")
-        ask = clob_price(tid, "buy")
+        try:
+            bid = clob_price(tid, "sell")
+        except Exception:
+            bid = None
+        try:
+            ask = clob_price(tid, "buy")
+        except Exception:
+            ask = None
         try:
             bid = float(bid) if bid is not None else None
         except Exception:
@@ -1272,26 +3004,32 @@ def current_prices(user: User = Depends(get_current_user)):
         return {"bid": bid, "ask": ask, "mid": mid}
     up = _px(up_id)
     dn = _px(dn_id)
-    return {"ts": datetime.utcnow().isoformat()+"Z", "date": d.isoformat(), "up": up, "down": dn}
+    result = {"ts": _utc_now_iso(), "date": d.isoformat(), "up": up, "down": dn}
+    _CURRENT_PRICES_CACHE["data"] = result
+    _CURRENT_PRICES_CACHE["ts"] = now
+    return result
 
 
 def _record_current_prices_once():
     """Fetch current mid prices and append to PRICE_LOG."""
     try:
         d = _active_market_date()
-        up_id, dn_id, _ = resolve_bitcoin_updown_token_ids_for_date(d)
-        def _mid(t):
-            bid = clob_price(t, "sell"); ask = clob_price(t, "buy")
-            try: bid = float(bid) if bid is not None else None
-            except Exception: bid=None
-            try: ask = float(ask) if ask is not None else None
-            except Exception: ask=None
-            return (bid+ask)/2.0 if (bid and ask) else (ask or bid or 0.0)
-        up_mid = _mid(up_id)
-        dn_mid = _mid(dn_id)
-        ts = datetime.utcnow().replace(microsecond=0).isoformat()+"Z"
+        up_id, dn_id, _ = _resolve_market_for_date(d)
+        up_mid = _safe_mid_price(up_id)
+        dn_mid = _safe_mid_price(dn_id)
+        # Do not write synthetic 0/0 rows when no book data is available.
+        if up_mid is None and dn_mid is None:
+            return
+        # Derive complement when only one side is available.
+        if up_mid is None and dn_mid is not None:
+            up_mid = 1.0 - dn_mid
+        if dn_mid is None and up_mid is not None:
+            dn_mid = 1.0 - up_mid
+        if up_mid is None or dn_mid is None:
+            return
+        ts = _utc_now_iso()
         # Keep values bounded (0..1 typical), but store raw float
-        _append_price_row(ts, float(up_mid or 0.0), float(dn_mid or 0.0))
+        _append_price_row(ts, float(up_mid), float(dn_mid))
     except Exception:
         pass
 
@@ -1304,7 +3042,7 @@ def _price_recorder_loop(period_sec: float = 60.0):
     _ensure_price_log_header()
     # Seed: copy last 7 days from HIST_CSV into our log if missing
     try:
-        today = datetime.utcnow().date()
+        today = datetime.now(timezone.utc).date()
         for i in range(1, 8):
             day = today - timedelta(days=i)
             pts = []
@@ -1329,6 +3067,19 @@ def _price_recorder_loop(period_sec: float = 60.0):
 
 @app.on_event("startup")
 def _on_startup():
+    global TOKENS
+    try:
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(_loop_exception_handler)
+    except Exception:
+        pass
+    # Pre-load persisted tokens so no request ever hits an empty TOKENS dict
+    try:
+        disk = _load_tokens_file()
+        if disk:
+            TOKENS.update(disk)
+    except Exception:
+        pass
     # Ensure recorder is running even when launched via `uvicorn module:app`
     global _recorder_thread
     _recorder_stop.clear()
@@ -1374,6 +3125,8 @@ def _position_cost_since(ledger_path: Path, start_dt: datetime):
                 try:
                     rec = json.loads(line)
                 except Exception:
+                    continue
+                if not is_confirmed_trade_record(rec):
                     continue
                 rts = rec.get("ts")
                 try:
@@ -1427,9 +3180,12 @@ def user_summary(user: User = Depends(get_current_user)):
     start = today_noon_et(now_et())
     cost = _position_cost_since(ledger, start)
     d = _active_market_date()
-    up_id, dn_id, _ = resolve_bitcoin_updown_token_ids_for_date(d)
+    up_id, dn_id, _ = _resolve_market_for_date(d)
     def _mid(t):
-        bid = clob_price(t, "sell"); ask = clob_price(t, "buy")
+        try: bid = clob_price(t, "sell")
+        except Exception: bid = None
+        try: ask = clob_price(t, "buy")
+        except Exception: ask = None
         try: bid = float(bid) if bid is not None else None
         except Exception: bid=None
         try: ask = float(ask) if ask is not None else None
@@ -1461,27 +3217,65 @@ def user_summary(user: User = Depends(get_current_user)):
     
     realized = unrealized = total_pnl = 0.0
     holdings_value = None
+    usdc_balance = None
+    usdc_breakdown: Dict[str, float] = {}
     address = None
+    safe_funder = None
+    funder_address = None
+    safe_address = None
     try:
-        from balance_checker import load_users_config, get_data_api_positions_pnl
-        users_cfg = load_users_config()
-        acct_cfg = users_cfg.get('_trading_config', {}).get('accounts', [])
+        from balance_checker import get_data_api_positions_pnl
+        db = _load_users()
+        acct_cfg = _trading_accounts_ref(db)
         target_priv = None
-        
-        # Find the account config for this user
-        for a in acct_cfg:
-            if a.get('name','').lower() == name.lower():
-                target_priv = a.get('private_key')
-                # Get main wallet address (what shows in Polymarket profile)
-                if target_priv and target_priv.startswith('0x') and 'REPLACE_WITH_TEST' not in target_priv:
-                    try:
-                        address = Account.from_key(target_priv).address
-                    except Exception:
-                        address = a.get('proxy_wallet') or a.get('address')
-                else:
-                    address = a.get('proxy_wallet') or a.get('address')
-                break
-        
+        acct = _find_trading_account(acct_cfg, name)
+        if not acct and user.is_admin:
+            acct = _find_trading_account(acct_cfg, "Founders")
+        if not acct:
+            enabled = [a for a in acct_cfg if _is_account_enabled(a)]
+            enabled.sort(key=lambda a: int(a.get("priority", 0) or 0), reverse=True)
+            acct = enabled[0] if enabled else (acct_cfg[0] if acct_cfg else None)
+        if acct:
+            target_priv = (
+                _decrypt_session_key(acct.get("trading_session_key"))
+                or _decrypt_session_key(acct.get("session_key"))
+                or _decrypt_session_key(acct.get("private_key"))
+            )
+            saved_owner = acct.get("wallet_owner")
+            candidate_safe = acct.get("safe_address")
+            if not candidate_safe:
+                # Backward compatibility: accept funder/proxy as safe only if it behaves like a Safe.
+                fallback_candidate = acct.get("funder") or acct.get("proxy_wallet")
+                if isinstance(fallback_candidate, str) and ETH_ADDR_RE.match(fallback_candidate):
+                    owners = _safe_owners_from_address(fallback_candidate, _chain_id_default())
+                    if owners:
+                        candidate_safe = fallback_candidate
+                        if not saved_owner:
+                            saved_owner = owners[0]
+            safe_address = candidate_safe
+            safe_funder = safe_address
+            address = safe_address
+            funder_address = saved_owner
+            if funder_address and safe_address and str(funder_address).lower() == str(safe_address).lower():
+                owners = _safe_owners_from_address(safe_address, _chain_id_default())
+                if owners:
+                    funder_address = owners[0]
+                if str(funder_address).lower() == str(safe_address).lower():
+                    funder_address = None
+            if (not funder_address) and safe_address:
+                owners = _safe_owners_from_address(safe_address, _chain_id_default())
+                if owners:
+                    funder_address = owners[0]
+            if not address and target_priv and target_priv.startswith('0x') and 'REPLACE_WITH_TEST' not in target_priv:
+                try:
+                    address = Account.from_key(target_priv).address
+                except Exception:
+                    address = None
+
+            usdc_total, usdc_parts = _polygon_usdc_balance(safe_address)
+            usdc_balance = usdc_total
+            usdc_breakdown = usdc_parts
+
         if address:
             # Try authenticated API first for more accurate data
             if target_priv and target_priv.startswith('0x') and 'REPLACE_WITH_TEST' not in target_priv:
@@ -1517,11 +3311,18 @@ def user_summary(user: User = Depends(get_current_user)):
     except Exception as e:
         print(f"Error user summary polymarket pnl: {e}")
     total_profit = total_pnl + base_profit
+    display_safe_balance = usdc_balance if usdc_balance is not None else holdings_value
     return {
         "date": d.isoformat(),
         "positions": {"UP": cost["UP"], "DOWN": cost["DOWN"]},
         "mark": {"UP": up_val, "DOWN": dn_val},
         "address": address,
+        "funder_address": funder_address,
+        "safe_address": safe_address or safe_funder or address,
+        "safe_funder": safe_funder or address,
+        "safe_balance": display_safe_balance,
+        "safe_balance_source": "polygon_usdc" if usdc_balance is not None else "polymarket_holdings",
+        "safe_usdc_tokens": usdc_breakdown,
         "realized_profit": realized,
         "unrealized_profit": unrealized,
         "total_pnl": total_pnl,
@@ -1709,29 +3510,32 @@ def restart_bot(user: User = Depends(require_admin)):
     return {"message": "Bot status reset to running"}
 
 
-def _tail_log_file(path: Path):
+async def _tail_log_file(path: Path, request: Request):
     try:
         with open(path, "r", encoding="utf-8") as f:
             f.seek(0, os.SEEK_END)
             while True:
+                # Break quickly when the client disconnects (or server is shutting down),
+                # so Ctrl+C can terminate cleanly.
+                if await request.is_disconnected():
+                    break
                 line = f.readline()
                 if not line:
-                    import time
-                    time.sleep(0.5)
+                    await asyncio.sleep(0.25)
                     continue
-                yield (line)
+                yield line
     except FileNotFoundError:
         yield "\n"
 
 
 @app.get("/api/logs/stream")
-def stream_logs(user: User = Depends(require_admin)):
+def stream_logs(request: Request, user: User = Depends(require_admin)):
     # Stream the latest log file
     files = list(LOGS_DIR.glob("*.log"))
     if not files:
         raise HTTPException(status_code=404, detail="No logs")
     latest = max(files, key=lambda p: p.stat().st_mtime)
-    return StreamingResponse(_tail_log_file(latest), media_type="text/plain")
+    return StreamingResponse(_tail_log_file(latest, request), media_type="text/plain")
 
 
 # --- Static files and landing ---
@@ -1787,12 +3591,25 @@ def main():
         
         if ssl_cert and ssl_key and os.path.exists(ssl_cert) and os.path.exists(ssl_key):
             print(f"Starting HTTPS server on https://10.0.0.147:{port}")
-            uvicorn.run(app, host="10.0.0.147", port=port, reload=False, 
-                       ssl_keyfile=ssl_key, ssl_certfile=ssl_cert)
+            uvicorn.run(
+                app,
+                host=os.environ.get("HOST", "0.0.0.0"),
+                port=port,
+                reload=False,
+                ssl_keyfile=ssl_key,
+                ssl_certfile=ssl_cert,
+                timeout_graceful_shutdown=2,
+            )
         else:
             print(f"Starting HTTP server on http://10.0.0.147:{port}")
             print("To enable HTTPS, set SSL_CERT_PATH and SSL_KEY_PATH environment variables")
-            uvicorn.run(app, host="10.0.0.147", port=port, reload=False)
+            uvicorn.run(
+                app,
+                host=os.environ.get("HOST", "0.0.0.0"),
+                port=port,
+                reload=False,
+                timeout_graceful_shutdown=2,
+            )
     finally:
         _recorder_stop.set()
         try:

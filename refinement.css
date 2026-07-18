@@ -1,0 +1,593 @@
+/* Final modern-preview refinements. Kept separate so the preview remains
+   isolated from the classic theme and older experiments cannot override it. */
+body main.container{
+    min-height:0 !important;
+    flex:1 0 auto;
+    margin-bottom:18px;
+}
+body #page-admin:not(.active){ display:none !important; }
+body .site-footer{
+    flex:0 0 auto;
+    margin:0 !important;
+    padding:0 !important;
+    border:0 !important;
+    border-top:1px solid rgba(137,158,184,.16) !important;
+    background:transparent;
+}
+body .footer-inner{
+    min-height:52px;
+    padding:8px 22px;
+    color:#66778b;
+    font-size:12px;
+}
+body .card{
+    border:0 !important;
+    box-shadow:0 14px 38px rgba(0,0,0,.20) !important;
+}
+
+/* Home and market embed */
+body #page-user .status-overview-card{
+    overflow:hidden;
+    box-shadow:0 14px 38px rgba(0,0,0,.22) !important;
+}
+body #page-user.active{ align-items:stretch !important; }
+body #page-user .status-overview-card .stats{
+    grid-template-rows:repeat(4,minmax(96px,1fr)) !important;
+    flex:1 1 auto !important;
+}
+body #page-user .status-overview-card .stat,
+body #page-user .status-overview-card .stat:nth-last-child(-n+2){
+    min-height:96px !important;
+}
+body #page-user .status-overview-card .stat,
+body #page-user .status-overview-card .stat:nth-last-child(-n+2){
+    background:transparent !important;
+    box-shadow:none !important;
+}
+body .market-overview-card .market-embed-shell{
+    height:auto !important;
+    min-height:0 !important;
+    padding:0 !important;
+    align-items:stretch !important;
+    overflow:hidden !important;
+    border:0 !important;
+    border-radius:14px !important;
+    background:transparent !important;
+    box-shadow:none !important;
+}
+body .official-polymarket-embed{
+    width:100% !important;
+    height:100% !important;
+    min-height:var(--embed-height,420px) !important;
+    padding:0 !important;
+    overflow:hidden !important;
+    border:0 !important;
+    border-radius:14px !important;
+    background:#1b1d1f !important;
+    clip-path:inset(0 round 14px) !important;
+    box-shadow:none !important;
+}
+body .official-polymarket-embed::after{ display:none !important; }
+body .official-polymarket-embed iframe{
+    width:calc(100% + 2px) !important;
+    height:calc(100% + 2px) !important;
+    margin:-1px !important;
+    border:0 !important;
+    border-radius:0 !important;
+    background:#1b1d1f !important;
+    clip-path:none !important;
+    pointer-events:none !important;
+}
+.official-polymarket-embed iframe{ pointer-events:none !important; }
+.official-polymarket-embed .polymarket-embed-link{
+    position:absolute;
+    z-index:4;
+    display:block;
+    pointer-events:auto !important;
+    background:transparent;
+}
+.official-polymarket-embed .polymarket-embed-brand-link{
+    top:14px;
+    left:18px;
+    width:150px;
+    height:38px;
+}
+.official-polymarket-embed .polymarket-embed-title-link{
+    top:58px;
+    left:20px;
+    width:min(620px,68%);
+    height:72px;
+}
+.official-polymarket-embed .polymarket-embed-view-link{
+    top:14px;
+    right:18px;
+    width:130px;
+    height:38px;
+}
+
+/* Stable local market chart: Polymarket presentation and links, with an
+   owned interactive graph so hover, time labels, and the line do not vanish. */
+.polymarket-chart-frame:has(.yahoo-graph-card){
+    height:400px !important;
+    min-height:400px !important;
+    overflow:hidden !important;
+    border-radius:16px !important;
+    background:#1b1d1f !important;
+}
+.yahoo-market-card.yahoo-graph-card{
+    box-sizing:border-box;
+    height:400px;
+    padding:16px 20px 12px;
+    gap:8px;
+    overflow:hidden;
+    border:0;
+    border-radius:16px;
+    background:#1b1d1f;
+    color:#f2f4f7;
+}
+.ym-brand-row{
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    min-height:26px;
+    gap:16px;
+}
+.ym-brand,
+.ym-market-link,
+.ym-market-title{
+    color:inherit;
+    text-decoration:none;
+}
+.ym-brand{
+    display:inline-flex;
+    align-items:center;
+    gap:0;
+    color:#8494a8;
+    font-size:13px;
+    font-weight:650;
+}
+.ym-market-link{
+    color:#8ea1bb;
+    font-size:12px;
+    font-weight:600;
+}
+.ym-market-link:hover,
+.ym-brand:hover{ color:#d5dfeb; }
+.ym-market-title-row{
+    display:flex;
+    align-items:center;
+    gap:13px;
+    min-height:50px;
+}
+.ym-bitcoin{
+    display:inline-flex;
+    align-items:center;
+    justify-content:center;
+    width:44px;
+    height:44px;
+    flex:0 0 44px;
+    border-radius:11px;
+    color:#fff;
+    background:#ff9418;
+    font-size:28px;
+    font-weight:800;
+}
+.ym-market-title{
+    min-width:0;
+    overflow:hidden;
+    color:#fff;
+    font-size:16px;
+    font-weight:760;
+    line-height:1.25;
+    text-overflow:ellipsis;
+    white-space:nowrap;
+}
+.ym-market-title:hover{ color:#dbe9fb; }
+.yahoo-graph-card .ym-topline{ min-height:32px; }
+.yahoo-graph-card .ym-main{ color:#eef6ff; font-size:18px; font-weight:730; }
+.yahoo-graph-card .ym-delta{ font-size:15px; font-weight:700; }
+.yahoo-graph-card .ym-dot{ width:8px; height:8px; background:#2da8ff; }
+.yahoo-graph-card .ym-mini-title{ display:none; }
+.yahoo-graph-card .ym-ranges{ gap:6px; }
+.yahoo-graph-card .ym-ranges button{ padding:5px 9px; border-radius:7px; }
+.yahoo-graph-card .ym-ranges button.active{
+    color:#ecf5ff;
+    border-color:rgba(45,168,255,.55);
+    background:rgba(45,168,255,.18);
+}
+.yahoo-graph-card .ym-graph-wrap{ height:246px; padding-top:0; }
+.yahoo-graph-card .ym-graph-stage,
+.yahoo-graph-card .ym-graph{ height:204px; }
+.yahoo-graph-card .ym-line.up{ stroke:#2da8ff; }
+.yahoo-graph-card .ym-point{ fill:#2da8ff; }
+.yahoo-graph-card .ym-hover-dot{ background:#2da8ff; }
+.yahoo-graph-card .ym-xlabels{ margin-top:0; color:#8495aa; font-size:10px; }
+.ym-axis-caption{
+    margin:0 58px 0 2px;
+    color:#718399;
+    font-size:10px;
+    line-height:14px;
+}
+
+/* About */
+body #page-home .info-sections > .card,
+body #page-home .strategy-risk-grid > .card{
+    border:0 !important;
+    box-shadow:0 16px 42px rgba(0,0,0,.20) !important;
+}
+body #page-home .about-card-heading{ border-bottom:0; padding-bottom:12px; }
+body #page-home .about-process-body{ padding-top:18px; }
+body #page-home .about-process-body ul{
+    grid-template-columns:repeat(2,minmax(0,1fr));
+    gap:8px;
+    overflow:visible;
+    border:0;
+    background:transparent;
+}
+body #page-home .about-process-body li{
+    min-height:64px;
+    padding:15px 16px 15px 32px;
+    border:0;
+    border-radius:10px;
+    background:#101923;
+    box-shadow:0 7px 18px rgba(0,0,0,.12);
+}
+body #page-home .about-process-body li::before{
+    left:16px;
+    top:24px;
+    width:4px;
+    height:4px;
+    border:0;
+    border-radius:50%;
+    background:#5b8def;
+}
+
+/* Profile */
+body #page-profile .page-shell-heading,
+body #page-profile .profile-workspace{
+    width:min(100%,1180px) !important;
+    max-width:1180px !important;
+    margin-left:0 !important;
+    margin-right:auto !important;
+}
+body #page-profile #account-card{
+    position:relative;
+    z-index:5;
+    overflow:visible !important;
+}
+body #page-profile #profile-trading-card{
+    position:relative;
+    z-index:1;
+    overflow:visible !important;
+}
+body #page-profile #account-card form{
+    grid-template-columns:220px minmax(0,1fr) !important;
+}
+body #page-profile #account-card .profile-account-grid{
+    grid-template-columns:minmax(230px,1fr) 180px auto !important;
+    grid-template-rows:auto auto !important;
+    gap:7px 12px;
+    padding:20px !important;
+    overflow:visible;
+}
+body #page-profile .profile-account-actions{
+    grid-column:3;
+    grid-row:2;
+    display:flex;
+    gap:8px;
+    align-items:center;
+}
+body #page-profile .profile-account-actions .btn{
+    width:auto !important;
+    min-width:128px;
+    min-height:44px;
+    padding:0 16px;
+}
+body #page-profile #pf-timezone-ui,
+body #page-profile #pf-timezone-menu{ z-index:90; }
+body #page-profile .profile-enabled-row{
+    width:calc(41% - 5.74px);
+    max-width:none;
+    min-height:72px;
+    padding:13px 16px !important;
+    border:0 !important;
+    border-radius:12px;
+    background:#0b1219 !important;
+    box-shadow:0 8px 24px rgba(0,0,0,.14);
+}
+body #page-profile .profile-enabled-row .ta-enabled-wrap{
+    min-width:0;
+    min-height:0 !important;
+    padding:0 !important;
+    border:0 !important;
+    border-radius:0;
+    background:transparent !important;
+}
+body #page-profile .profile-switch{
+    width:46px !important;
+    height:26px !important;
+    flex-basis:46px !important;
+}
+body #page-profile .profile-switch .slider::before{
+    width:18px !important;
+    height:18px !important;
+    left:3px !important;
+    bottom:3px !important;
+}
+body #page-profile .profile-switch input:checked + .slider::before{
+    transform:translateX(20px) !important;
+}
+body #page-profile .profile-settings-grid{
+    display:grid;
+    grid-template-columns:minmax(0,.82fr) minmax(0,1.18fr);
+    gap:14px;
+    margin-top:14px;
+}
+body #page-profile .profile-access-section,
+body #page-profile .profile-wallet-section,
+body #page-profile .profile-session-section{
+    min-width:0;
+    padding:16px;
+    border:0;
+    border-radius:13px;
+    background:#0b1219;
+    box-shadow:0 8px 24px rgba(0,0,0,.12);
+}
+body #page-profile .profile-session-section{ margin-top:14px; }
+body #page-profile .profile-subheading{
+    display:flex;
+    align-items:baseline;
+    justify-content:space-between;
+    gap:12px;
+    margin-bottom:12px;
+}
+body #page-profile .profile-subheading > span{ color:#dce5ef; font-size:13px; font-weight:720; }
+body #page-profile .profile-subheading small{ color:#70839a; font-size:11px; }
+body #page-profile .profile-auth-stack{
+    grid-template-columns:minmax(0,1fr) !important;
+    gap:10px;
+}
+body #page-profile .profile-private-key-actions{
+    grid-template-columns:minmax(0,1fr) auto !important;
+    grid-column:1 !important;
+    gap:8px;
+}
+body #page-profile .profile-private-key-actions .key-indicator{
+    min-height:42px;
+    padding:0 14px;
+    justify-content:flex-start;
+}
+body #page-profile .profile-private-key-actions .btn{
+    width:auto !important;
+    min-width:142px;
+    min-height:42px;
+}
+body #page-profile .profile-wallet-actions{
+    display:flex;
+    gap:8px;
+    margin:0 0 12px;
+}
+body #page-profile .profile-wallet-actions .btn{ width:auto; min-width:120px; min-height:42px; }
+body #page-profile .profile-address-stack{
+    grid-template-columns:minmax(0,1fr) !important;
+    gap:10px;
+    margin:0 !important;
+}
+body #page-profile .profile-key-grid{
+    display:flex;
+    flex-wrap:wrap;
+    gap:8px;
+    margin:0 !important;
+}
+body #page-profile .profile-key-grid .btn{
+    width:auto;
+    min-width:180px;
+    min-height:42px;
+    flex:0 1 auto;
+}
+body #page-profile .profile-key-status-row{ max-width:760px; gap:8px; margin-top:10px; }
+body #page-profile .trading-account-meta{
+    grid-template-columns:repeat(3,minmax(0,1fr));
+    gap:8px 18px;
+}
+body #page-profile .profile-tr-save-row{ justify-content:flex-end; }
+body #page-profile #pf-tr-save-settings{ width:auto; min-width:190px; min-height:44px; }
+
+/* Admin */
+body #page-admin .admin-card-icon{ display:none !important; }
+body #page-admin .admin-card-heading{
+    min-height:68px;
+    padding:15px 18px;
+    border-bottom:0;
+    background:transparent;
+}
+body #page-admin .admin-control-deck{
+    grid-template-columns:repeat(3,minmax(0,1fr)) !important;
+    justify-content:stretch;
+    align-items:stretch;
+}
+body #page-admin .admin-control-deck > .card{
+    height:100% !important;
+    display:flex;
+    flex-direction:column;
+}
+body #page-admin .admin-control-deck > .card > .admin-panel{ flex:1; }
+body #page-admin .admin-commands-card .toolbar{
+    display:grid;
+    grid-template-columns:1fr;
+    gap:9px;
+}
+body #page-admin .admin-commands-card .btn{
+    width:100% !important;
+    min-height:42px;
+}
+body #page-admin .admin-policy-card .control-stack{
+    grid-template-columns:minmax(0,1fr) !important;
+    gap:10px;
+}
+body #page-admin .admin-policy-card .admin-panel{ padding:18px; }
+body #page-admin .admin-policy-card .control-group{
+    min-height:0;
+    padding:0;
+    gap:7px;
+    border:0;
+    background:transparent;
+}
+body #page-admin .admin-policy-card #save-control{
+    width:140px !important;
+    min-width:140px !important;
+    min-height:42px;
+    margin:12px 0 0 auto;
+}
+body #page-admin .admin-operations-grid{
+    grid-template-columns:minmax(0,1fr) !important;
+}
+body #page-admin #trading-accounts-card{ order:2; }
+body #page-admin .admin-history-card{ order:1; min-width:0; width:100%; }
+body #page-admin .admin-history-card .admin-panel{ padding:0 18px 14px; }
+body #page-admin .history-wrap{ width:100%; max-height:330px; overflow:auto; }
+body #page-admin .history-wrap table{ width:100%; table-layout:fixed; }
+body #page-admin .history-wrap th:last-child,
+body #page-admin .history-wrap td:last-child{ text-align:right; }
+body #page-admin .trading-accounts-list{ gap:14px; background:transparent; }
+body #page-admin .trading-account-item{
+    border:0 !important;
+    background:#0b1219;
+    box-shadow:0 10px 28px rgba(0,0,0,.17);
+}
+body #page-admin .trading-account-head{ padding:18px 22px; border-bottom:0; }
+body #page-admin .ta-account-body{
+    grid-template-columns:280px minmax(0,1fr) 300px !important;
+    gap:0;
+    border-top:1px solid rgba(144,165,193,.07);
+    border-bottom:1px solid rgba(144,165,193,.07);
+    background:transparent;
+}
+body #page-admin .ta-account-body > section{
+    min-width:0;
+    padding:20px 22px;
+    background:transparent;
+}
+body #page-admin .ta-access-panel,
+body #page-admin .ta-wallet-panel{ border-right:1px solid rgba(144,165,193,.07); }
+body #page-admin .ta-section-heading{
+    min-height:38px;
+    align-items:flex-start;
+    flex-direction:column;
+    justify-content:flex-start;
+    gap:3px;
+    margin-bottom:12px;
+}
+body #page-admin .ta-enabled-switch-row{
+    min-height:66px;
+    padding:12px 14px;
+    gap:12px;
+    border:0;
+    background:#101a24;
+}
+body #page-admin .ta-enabled-switch-row strong{ white-space:nowrap; font-size:14px; }
+body #page-admin .ta-enabled-switch-row small{ margin-top:3px; }
+body #page-admin .ta-wallet-row{
+    grid-template-columns:minmax(0,1fr) 170px !important;
+    gap:14px;
+    align-items:stretch;
+}
+body #page-admin .ta-funder,
+body #page-admin .ta-connect-wallet{ min-height:54px; }
+body #page-admin .ta-connect-wallet{ width:auto; min-width:150px; }
+body #page-admin .ta-policy-panel{
+    grid-column:auto !important;
+    grid-template-columns:minmax(0,1fr) !important;
+    align-content:start;
+    justify-content:stretch;
+    gap:12px;
+}
+body #page-admin .ta-admin-role{
+    width:100%;
+    min-height:58px;
+    padding:10px 12px;
+    border:0;
+    background:#101a24;
+}
+body #page-admin .ta-admin-role > input{
+    position:absolute;
+    width:1px;
+    height:1px;
+    opacity:0;
+    pointer-events:none;
+}
+body #page-admin .ta-role-check{
+    position:relative;
+    width:20px;
+    height:20px;
+    flex:0 0 20px;
+    border:1px solid rgba(144,165,193,.34);
+    border-radius:6px;
+    background:#0a1118;
+}
+body #page-admin .ta-admin-role > input:checked + .ta-role-check{
+    border-color:#4e82dd;
+    background:#4e82dd;
+}
+body #page-admin .ta-admin-role > input:checked + .ta-role-check::after{
+    content:"";
+    position:absolute;
+    left:6px;
+    top:3px;
+    width:5px;
+    height:9px;
+    border:solid white;
+    border-width:0 2px 2px 0;
+    transform:rotate(45deg);
+}
+body #page-admin .ta-key-panel{
+    grid-template-columns:minmax(0,1fr) auto !important;
+    gap:18px;
+    padding:18px 22px;
+}
+body #page-admin .trading-key-grid .btn{ width:auto; min-width:170px; }
+body #page-admin .ta-account-actions{
+    grid-template-columns:auto auto !important;
+    padding:18px 22px;
+}
+body #page-admin .ta-account-actions .btn{ width:auto !important; min-width:150px; }
+body #shutdown-bot-btn,
+body #emergency-confirm{
+    color:#fff !important;
+    background:linear-gradient(180deg,#b83b45,#8e232c) !important;
+    border:1px solid #d05a63 !important;
+    box-shadow:0 8px 20px rgba(141,31,41,.24) !important;
+}
+body #shutdown-bot-btn:hover,
+body #emergency-confirm:hover{
+    background:linear-gradient(180deg,#ca4852,#a32933) !important;
+    border-color:#e06a72 !important;
+}
+
+@media (max-width:1050px){
+    body #page-profile #account-card form{ grid-template-columns:1fr !important; }
+    body #page-admin .admin-control-deck{ grid-template-columns:1fr 1fr !important; }
+}
+@media (max-width:1200px){
+    body #page-admin .ta-account-body{
+        grid-template-columns:280px minmax(0,1fr) !important;
+    }
+    body #page-admin .ta-policy-panel{
+        grid-column:1 / -1 !important;
+        grid-template-columns:240px minmax(260px,1fr) !important;
+        align-items:end;
+    }
+}
+@media (max-width:820px){
+    body #page-profile #account-card .profile-account-grid,
+    body #page-profile .profile-settings-grid,
+    body #page-admin .admin-control-deck,
+    body #page-admin .admin-side-rail,
+    body #page-admin .ta-account-body,
+    body #page-admin .ta-policy-panel{
+        grid-template-columns:1fr !important;
+    }
+    body #page-profile .profile-account-actions{ grid-column:1; grid-row:auto; }
+    body #page-profile .profile-enabled-row{ width:100%; }
+    body #page-admin .ta-access-panel{ border-right:0; }
+}

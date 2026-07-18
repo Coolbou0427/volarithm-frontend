@@ -5,6 +5,17 @@ let isAdmin = false;
 let currentUsername = '';
 // Default to PST if not set
 let userTimezone = 'America/Los_Angeles';
+let marketLiveTimer = null;
+let marketRangePreference = 'MKT';
+const MARKET_LIVE_REFRESH_MS = 58000;
+const MARKET_SERIES_REFRESH_MS = 60000;
+let marketEmbedInFlight = false;
+let marketSeriesCache = null;
+let marketSeriesLastRefreshMs = 0;
+
+// The modern workspace is the sole supported interface; the legacy theme has
+// no conditional stylesheet or per-browser toggle.
+try { localStorage.removeItem('volarithm-visual-theme'); } catch (_) {}
 
 // Close both dropdown menus (hamburger and user) and reset caret state
 function closeMenus(){
@@ -20,6 +31,12 @@ function closeMenus(){
 function showToast(message, kind='success', ms=2400){
     const root = document.getElementById('toast-root');
     if (!root) { console.log(message); return; }
+    const existing = Array.from(root.querySelectorAll('.toast'));
+    const maxToasts = 3;
+    while (existing.length >= maxToasts){
+        const oldest = existing.shift();
+        try { oldest.remove(); } catch(_) {}
+    }
     const t = document.createElement('div');
     t.className = `toast toast-${kind}`;
     t.textContent = message;
@@ -72,31 +89,21 @@ function authHeaders() { const t=getToken(); return t? { 'Authorization': 'Beare
 function isAuthed(){ return !!getToken(); }
 function doLogout(){ setToken(null); try{ history.replaceState({},'', '/'); }catch(_){} location.reload(); }
 function show(page) {
-    // Set loading state on all pages first
+    const target = $(page);
     $$('.page').forEach(el => {
-        el.setAttribute('data-loading', 'true');
-        el.classList.remove('active');
-    });
-
-    // Small delay to ensure stable layout before showing target
-    setTimeout(() => {
-        const target = $(page);
-        if (target) {
-            target.classList.add('active');
-            target.removeAttribute('data-loading');
+        const isTarget = !!target && el === target;
+        if (isTarget) {
+            el.classList.add('active');
+        } else {
+            el.classList.remove('active');
         }
-
-        // Remove loading state from all other pages
-        $$('.page').forEach(el => {
-            if (el !== target) {
-                el.removeAttribute('data-loading');
-            }
-        });
-    }, 30);
+        el.removeAttribute('data-loading');
+    });
 }
 // Simple routers for both path and hash (support deep links and older hashes)
 function routeFromLocation(){
     const p = (location.pathname || '/').toLowerCase();
+    if (!(p.startsWith('/user') || p.startsWith('/home'))) stopMarketLiveUpdates();
     if (p.startsWith('/admin')) { if (isAuthed() && isAdmin){ show('#page-admin'); loadAdmin(); } else { show('#page-home'); } closeMenus(); return; }
     if (p.startsWith('/profile')) { if (isAuthed()){ loadProfile(); show('#page-profile'); } else { show('#page-home'); } closeMenus(); return; }
     if (p.startsWith('/user') || p.startsWith('/home')) { if (isAuthed()){ show('#page-user'); loadUserData(); } else { show('#page-home'); } closeMenus(); return; }
@@ -114,6 +121,7 @@ function routeFromLocation(){
 function routeFromHash(){
     const h = (location.hash || '').toLowerCase();
     if (!h) return false;
+    if (!(h.startsWith('#/user') || h.startsWith('#/home'))) stopMarketLiveUpdates();
     if (h.startsWith('#/admin')) { if (isAuthed() && isAdmin){ show('#page-admin'); loadAdmin(); } else { show('#page-home'); } return true; }
     if (h.startsWith('#/profile')) { if (isAuthed()){ loadProfile(); show('#page-profile'); } else { show('#page-home'); } return true; }
     if (h.startsWith('#/user') || h.startsWith('#/home')) { if (isAuthed()){ show('#page-user'); loadUserData(); } else { show('#page-home'); } return true; }
@@ -287,12 +295,12 @@ $('#auth-submit').onclick = async (e)=>{
     try {
         if (dlg.dataset.mode === 'signup') {
             // client-side strong password check mirrors server rule
-            const strong = /^(?=.*[A-Za-z])(?=.*\d).{10,}$/.test(p);
+            const strong = /^(?=.*[A-Za-z])(?=.*\d).{10,20}$/.test(p);
             if (!strong) {
                 // Show requirements, place focus, and use native validity bubble
                 $('#pw-req').style.display = 'block';
                 const pw = $('#auth-password');
-                pw.setCustomValidity('Password must be 10+ characters and include letters and numbers.');
+                pw.setCustomValidity('Password must be 10-20 characters and include letters and numbers.');
                 pw.reportValidity();
                 pw.focus();
                 return;
@@ -324,9 +332,17 @@ $('#auth-submit').onclick = async (e)=>{
 const btn = document.getElementById('auth-password-toggle');
 const inp = document.getElementById('auth-password');
 if (btn && inp){
+    const sync = ()=>{
+        const isPw = inp.getAttribute('type') === 'password';
+        btn.classList.toggle('is-revealed', !isPw);
+        btn.title = isPw ? 'Show password' : 'Hide password';
+        btn.setAttribute('aria-label', btn.title);
+    };
+    sync();
     btn.addEventListener('click', ()=>{
         const isPw = inp.getAttribute('type') === 'password';
         inp.setAttribute('type', isPw ? 'text' : 'password');
+        sync();
     });
 }
 })();
@@ -337,16 +353,17 @@ pwInput.addEventListener('input', ()=>{
 const v = pwInput.value || '';
 const isSignup = (dlg.dataset.mode === 'signup');
 const hasLen = v.length >= 10;
+const hasMax = v.length <= 20;
 const hasLet = /[A-Za-z]/.test(v);
 const hasDig = /\d/.test(v);
 // Only show requirements when signing up
 $('#pw-req').style.display = (isSignup && v.length) ? 'block' : 'none';
 if (isSignup){
     const set = (sel, ok)=>{ const el = $(`#pw-req li[data-rule="${sel}"]`); if (el) el.classList.toggle('ok', !!ok); };
-    set('len', hasLen); set('letters', hasLet); set('digits', hasDig);
+    set('len', hasLen); set('max', hasMax); set('letters', hasLet); set('digits', hasDig);
     // Clear or set custom validity live (signup only)
-    if (hasLen && hasLet && hasDig) { pwInput.setCustomValidity(''); }
-    else { pwInput.setCustomValidity('Password must be 10+ characters and include letters and numbers.'); }
+    if (hasLen && hasMax && hasLet && hasDig) { pwInput.setCustomValidity(''); }
+    else { pwInput.setCustomValidity('Password must be 10-20 characters and include letters and numbers.'); }
 } else {
     // No custom validity for login mode
     pwInput.setCustomValidity('');
@@ -364,8 +381,8 @@ async function postLogin(){
     const uname = currentUsername || 'user';
     $('#user-menu-name').textContent = uname;
     $('#user-menu').classList.remove('hidden');
-    // Hide "Get Started" card on landing when logged in
-    document.querySelector('.hero-right')?.classList.add('hidden');
+    // The modern About page keeps its strategy visual while the classic layout
+    // still hides the sign-up panel through its authenticated CSS rule.
     $('#nav-user').classList.remove('hidden');
     if (isAdmin) $('#nav-admin').classList.remove('hidden');
 
@@ -443,6 +460,7 @@ async function loadAdmin(){
             }catch(err){ showToast(err.message||'Failed to refresh stats', 'error'); }
         });
     }
+    await loadAdminTradingAccounts();
 }
 
 function initAdminControls() {
@@ -533,7 +551,7 @@ function initAdminControls() {
                     const n = Number(stakeValue);
                     if (!Number.isNaN(n)) body.stake_multiplier = n;
                 }
-                // If no changes selected, still send an empty object which the API should accept; otherwise, it’s a no-op
+                // If no changes selected, still send an empty object which the API should accept; otherwise, it's a no-op
                 const r = await fetch('/api/control', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json', ...authHeaders() },
@@ -576,118 +594,807 @@ function initAdminControls() {
     }
 }
 
-// Load the Polymarket small card using the official web component
-async function updatePolymarketEmbed() {
+function setMarketHostLoading(host){
+    host.dataset.marketLoading = '1';
+    host.dataset.marketLoadingStart = String(Date.now());
+    if (!document.getElementById('market-loader-inline-keyframes')){
+        const st = document.createElement('style');
+        st.id = 'market-loader-inline-keyframes';
+        st.textContent = `
+            @keyframes marketSkelShift {
+                0% { background-position: 200% 0; }
+                100% { background-position: -200% 0; }
+            }
+        `;
+        document.head.appendChild(st);
+    }
+    host.innerHTML = `
+        <div class="market-loading-skeleton" aria-hidden="true" style="position:absolute;inset:0;border-radius:8px;background:linear-gradient(90deg, rgba(255,255,255,.06) 25%, rgba(255,255,255,.16) 50%, rgba(255,255,255,.06) 75%);background-size:200% 100%;animation:marketSkelShift 1.15s linear infinite;z-index:0;"></div>
+        <div class="market-skel-card" aria-hidden="true" style="position:absolute;inset:12px 14px;display:flex;flex-direction:column;gap:10px;z-index:1;">
+            <div class="market-skel-row" style="display:flex;justify-content:space-between;align-items:center;gap:10px;">
+                <div class="market-skel-pill w-40" style="height:14px;width:40%;border-radius:8px;background:linear-gradient(90deg, rgba(255,255,255,.18) 20%, rgba(255,255,255,.36) 50%, rgba(255,255,255,.18) 80%);background-size:220% 100%;animation:marketSkelShift 1.15s ease-in-out infinite;"></div>
+                <div class="market-skel-pill w-12" style="height:14px;width:12%;border-radius:8px;background:linear-gradient(90deg, rgba(255,255,255,.18) 20%, rgba(255,255,255,.36) 50%, rgba(255,255,255,.18) 80%);background-size:220% 100%;animation:marketSkelShift 1.15s ease-in-out infinite;"></div>
+            </div>
+            <div class="market-skel-pill w-28" style="height:14px;width:28%;border-radius:8px;background:linear-gradient(90deg, rgba(255,255,255,.18) 20%, rgba(255,255,255,.36) 50%, rgba(255,255,255,.18) 80%);background-size:220% 100%;animation:marketSkelShift 1.15s ease-in-out infinite;"></div>
+            <div class="market-skel-graph" style="flex:1;min-height:180px;border-radius:10px;background:linear-gradient(90deg, rgba(255,255,255,.12) 20%, rgba(255,255,255,.26) 50%, rgba(255,255,255,.12) 80%);background-size:220% 100%;animation:marketSkelShift 1.15s ease-in-out infinite;"></div>
+            <div class="market-skel-row" style="display:flex;justify-content:space-between;align-items:center;gap:10px;">
+                <div class="market-skel-pill w-16" style="height:14px;width:16%;border-radius:8px;background:linear-gradient(90deg, rgba(255,255,255,.18) 20%, rgba(255,255,255,.36) 50%, rgba(255,255,255,.18) 80%);background-size:220% 100%;animation:marketSkelShift 1.15s ease-in-out infinite;"></div>
+                <div class="market-skel-pill w-16" style="height:14px;width:16%;border-radius:8px;background:linear-gradient(90deg, rgba(255,255,255,.18) 20%, rgba(255,255,255,.36) 50%, rgba(255,255,255,.18) 80%);background-size:220% 100%;animation:marketSkelShift 1.15s ease-in-out infinite;"></div>
+            </div>
+        </div>
+        <div class="market-loading-text" style="position:relative;z-index:2;color:#c6d8f3;font-size:13px;font-weight:600;text-shadow:0 1px 0 rgba(0,0,0,.25);pointer-events:none;">Loading market...</div>
+    `;
+}
+
+async function ensureMarketLoaderVisible(host, showLoading, minMs = 550){
+    if (!showLoading || !host) return;
+    const started = Number(host.dataset.marketLoadingStart || 0);
+    if (!Number.isFinite(started) || started <= 0) return;
+    const elapsed = Date.now() - started;
+    const wait = Math.max(0, minMs - elapsed);
+    if (wait > 0){
+        await new Promise((resolve)=> setTimeout(resolve, wait));
+    }
+}
+
+function clearMarketLoadingState(host){
+    if (!host) return;
+    delete host.dataset.marketLoading;
+    delete host.dataset.marketLoadingStart;
+}
+
+function withLatestCurrentPoint(series, cur){
+    const points = Array.isArray(series?.points) ? series.points.slice() : [];
+    const upRaw = toFiniteNumber(cur?.up?.mid ?? cur?.up?.ask ?? cur?.up?.bid);
+    const downRaw = toFiniteNumber(cur?.down?.mid ?? cur?.down?.ask ?? cur?.down?.bid);
+    let up = upRaw;
+    let down = downRaw;
+    if (up !== null && up > 1) up = up / 100;
+    if (down !== null && down > 1) down = down / 100;
+    // If one side is missing, derive complement from the other.
+    if (up === null && down !== null) up = 1 - down;
+    if (down === null && up !== null) down = 1 - up;
+    // If still missing, don't inject a fake 0% point.
+    if (up === null || down === null) return { points };
+    points.push({
+        ts: new Date().toISOString(),
+        up,
+        down,
+    });
+    return { points };
+}
+
+function toFiniteNumber(v){
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+}
+
+function normalizedMid(cur, side){
+    const raw = toFiniteNumber(cur?.[side]?.mid ?? cur?.[side]?.ask ?? cur?.[side]?.bid);
+    if (raw === null) return null;
+    if (raw > 1) return raw / 100;
+    return raw;
+}
+
+function currentLooksUsable(cur){
+    const up = normalizedMid(cur, 'up');
+    const down = normalizedMid(cur, 'down');
+    return (up !== null && up > 0) || (down !== null && down > 0);
+}
+
+async function fetchPolymarketEventBySlug(slug) {
+    const ctl = new AbortController();
+    const timeout = setTimeout(()=> ctl.abort(), 8000);
+    let res;
+    try {
+        // Route through backend to avoid browser CORS/rate-limit edge cases.
+        res = await fetch(`/api/polymarket/current-by-slug?slug=${encodeURIComponent(slug)}`, {
+            signal: ctl.signal,
+            headers: authHeaders(),
+        });
+    } finally {
+        clearTimeout(timeout);
+    }
+    if (!res.ok) throw new Error(`Gamma current fetch failed: ${res.status}`);
+    return res.json();
+}
+
+function parseJsonArrayMaybe(v){
+    if (Array.isArray(v)) return v;
+    if (typeof v !== 'string') return null;
+    try {
+        const parsed = JSON.parse(v);
+        return Array.isArray(parsed) ? parsed : null;
+    } catch (_) {
+        return null;
+    }
+}
+
+function findGammaMarketBySlug(eventPayload, slug){
+    if (!eventPayload || typeof eventPayload !== 'object') return null;
+    const list = Array.isArray(eventPayload?.markets) ? eventPayload.markets : [];
+    if (!list.length) return null;
+    const exact = list.find((m)=> String(m?.slug || '').trim() === String(slug || '').trim());
+    return exact || list[0] || null;
+}
+
+function currentFromGammaEvent(eventPayload, slug){
+    // Backend-normalized preferred payload.
+    if (eventPayload?.current?.up?.mid != null) {
+        return eventPayload.current;
+    }
+    const market = findGammaMarketBySlug(eventPayload, slug) || eventPayload?.market;
+    if (!market) return null;
+
+    const outcomes = parseJsonArrayMaybe(market?.outcomes) || [];
+    const prices = parseJsonArrayMaybe(market?.outcomePrices) || [];
+    if (prices.length < 2){
+        const bid = toFiniteNumber(market?.bestBid);
+        const ask = toFiniteNumber(market?.bestAsk);
+        const last = toFiniteNumber(market?.lastTradePrice);
+        const mid = (bid !== null && ask !== null) ? ((bid + ask) / 2) : (last ?? ask ?? bid);
+        if (mid === null) return null;
+        const upMid = mid > 1 ? (mid / 100) : mid;
+        return { up: { mid: upMid }, down: { mid: 1 - upMid } };
+    }
+
+    const labels = outcomes.map((x)=> String(x || '').toLowerCase());
+    let upIdx = labels.findIndex((x)=> x.includes('up'));
+    if (upIdx < 0) upIdx = 0;
+    const downIdx = upIdx === 0 ? 1 : 0;
+    const up = toFiniteNumber(prices[upIdx]);
+    const down = toFiniteNumber(prices[downIdx]);
+    if (up === null || down === null) return null;
+    return {
+        up: { mid: up > 1 ? up / 100 : up },
+        down: { mid: down > 1 ? down / 100 : down },
+    };
+}
+
+function applyGammaEventToActive(active, gammaEvent, slug){
+    const market = findGammaMarketBySlug(gammaEvent, slug);
+    if (!market) return active;
+    return {
+        ...active,
+        market: {
+            ...(active?.market || {}),
+            slug: market?.slug || active?.market?.slug || slug,
+            title: market?.question || active?.market?.title,
+            question: market?.question || active?.market?.question,
+        },
+    };
+}
+
+function preferBestCurrent(primaryCur, fallbackCur){
+    const pUp = normalizedMid(primaryCur, 'up');
+    const fUp = normalizedMid(fallbackCur, 'up');
+    // If primary is missing or pinned at 0 while fallback has a real value, use fallback.
+    if (fUp !== null && fUp > 0 && (pUp === null || pUp <= 0)) return fallbackCur;
+    if (currentLooksUsable(primaryCur)) return primaryCur;
+    if (currentLooksUsable(fallbackCur)) return fallbackCur;
+    return primaryCur || fallbackCur || {};
+}
+
+function normalizeOutcomeLabel(v, i){
+    const s = String(v || '').trim();
+    if (!s) return i === 0 ? 'Yes' : (i === 1 ? 'No' : `Outcome ${i+1}`);
+    return s;
+}
+
+function findPredictionOutcomes(payload){
+    const seen = [];
+    const queue = [payload];
+    while (queue.length){
+        const cur = queue.shift();
+        if (!cur || typeof cur !== 'object') continue;
+        if (Array.isArray(cur)){
+            cur.forEach(v => queue.push(v));
+            continue;
+        }
+        const keys = Object.keys(cur);
+        const hasLabel = ('label' in cur) || ('name' in cur) || ('title' in cur);
+        const hasProb = ('probability' in cur) || ('price' in cur) || ('lastPrice' in cur) || ('value' in cur);
+        if (hasLabel && hasProb){
+            const label = cur.label || cur.name || cur.title;
+            const raw = cur.probability ?? cur.price ?? cur.lastPrice ?? cur.value;
+            const num = Number(raw);
+            if (Number.isFinite(num)){
+                const pct = num > 1 ? num : (num * 100);
+                seen.push({ label: String(label || ''), pct: Math.max(0, Math.min(100, pct)) });
+            }
+        }
+        keys.forEach(k => queue.push(cur[k]));
+    }
+    const byLabel = new Map();
+    for (const o of seen){
+        const key = o.label.trim().toLowerCase();
+        if (!key) continue;
+        if (!byLabel.has(key)) byLabel.set(key, o);
+    }
+    return Array.from(byLabel.values()).slice(0, 2);
+}
+
+function renderPredictionMarketCard(host, slug, payload){
+    const root = (payload && typeof payload === 'object') ? payload : {};
+    const title = String(
+        root?.event?.title ||
+        root?.event?.name ||
+        root?.title ||
+        root?.name ||
+        slug || 'Today\'s market'
+    ).trim();
+    const outcomes = findPredictionOutcomes(root);
+    const rows = outcomes.length ? outcomes : [{label:'Yes', pct:50},{label:'No', pct:50}];
+    const src = `https://polymarket.com/event/${encodeURIComponent(slug)}?utm_source=yahoo_finance&utm_medium=referral`;
+    host.innerHTML = `
+        <div class="yahoo-market-card">
+            <div class="ym-head">
+                <div class="ym-title">${title}</div>
+                <a class="ym-link" href="${src}" target="_blank" rel="noopener">Powered by Polymarket</a>
+            </div>
+            <div class="ym-rows">
+                ${rows.map((o, i)=>`
+                    <div class="ym-row">
+                        <div class="ym-row-top">
+                            <span>${normalizeOutcomeLabel(o.label, i)}</span>
+                            <span>${Number(o.pct).toFixed(1)}%</span>
+                        </div>
+                        <div class="ym-bar"><span style="width:${Math.max(0, Math.min(100, Number(o.pct)||0))}%"></span></div>
+                    </div>
+                `).join('')}
+            </div>
+        </div>
+    `;
+}
+
+function renderLocalGraphCard(host, slug, active, daySeries, prices, preferredRange){
+    const title = String(active?.market?.question || active?.market?.title || slug || "Today's market").trim();
+    const marketUrl = `https://polymarket.com/event/${encodeURIComponent(slug)}`;
+    const upMid = Number(prices?.up?.mid);
+    if (!Number.isFinite(upMid)) {
+        throw new Error('Missing or invalid up.mid price');
+    }
+    const upPct = Math.max(0, Math.min(100, upMid > 1 ? upMid : (upMid * 100)));
+
+    const pts = Array.isArray(daySeries?.points) ? daySeries.points : [];
+    const nowMs = Date.now();
+    const normalized = pts
+        .map((p)=>{
+            const ts = String(p?.ts || '');
+            const t = Date.parse(ts);
+            const upRaw = toFiniteNumber(p?.up);
+            const downRaw = toFiniteNumber(p?.down);
+            let up = upRaw;
+            if (up === null && downRaw !== null){
+                const downNorm = downRaw > 1 ? (downRaw / 100) : downRaw;
+                up = 1 - downNorm;
+            }
+            if (up !== null && up > 1) up = up / 100;
+            return { ts, up, t };
+        })
+        .filter((p)=>Number.isFinite(p.up))
+        .filter((p)=>Number.isFinite(p.t))
+        .filter((p)=>p.t <= (nowMs + 60 * 1000))
+        .sort((a,b)=>a.t-b.t);
+
+    const W = 980;
+    const H = 228;
+    const PAD_T = 12;
+    const PAD_B = 26;
+    const PAD_L = 8;
+    const PAD_R = 58;
+    const minY = 0;
+    const maxY = 100;
+    const n = normalized.length;
+    const pctValue = (v)=> {
+        const p = Number(v);
+        if (!Number.isFinite(p)) return 0;
+        return Math.max(0, Math.min(100, p > 1 ? p : (p * 100)));
+    };
+    const toY = (v)=> {
+        const clamped = pctValue(v);
+        const t = (clamped - minY) / (maxY - minY);
+        return Math.round(PAD_T + (1 - t) * (H - PAD_T - PAD_B));
+    };
+
+    function marketStartMs(){
+        // Align with backend/Yahoo market-day roll:
+        // market date D starts at noon ET on D-1 and runs until noon ET on D.
+        const activeDate = String(active?.date || '');
+        const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(activeDate);
+        const tz = 'America/New_York';
+        if (!m){
+            // Conservative fallback: derive from "now" using the same noon-ET roll.
+            const now = new Date();
+            const p = tzParts(tz, now);
+            let noon = utcMsForWall(tz, p.year, p.month - 1, p.day, 12, 0, 0);
+            if (now.getTime() < noon) noon -= (24 * 60 * 60 * 1000);
+            return noon - (24 * 60 * 60 * 1000);
+        }
+        const year = Number(m[1]);
+        const month = Number(m[2]);
+        const day = Number(m[3]);
+        const marketDayNoon = utcMsForWall(tz, year, month - 1, day, 12, 0, 0);
+        return marketDayNoon - (24 * 60 * 60 * 1000);
+    }
+
+    function rangeBounds(rangeKey){
+        const endMs = Date.now();
+        if (rangeKey === 'MKT'){
+            return { startMs: marketStartMs(), endMs };
+        }
+        const rangeMinutes = { '1M': 1, '10M': 10, '30M': 30, '1H': 60, '3H': 180 };
+        const mins = rangeMinutes[rangeKey] || 60;
+        return { startMs: endMs - (mins * 60 * 1000), endMs };
+    }
+
+    function pointsForRange(rangeKey){
+        if (!n){
+            const b = rangeBounds(rangeKey);
+            // Keep a real, inspectable baseline visible while the recorder is
+            // warming up or a refresh temporarily returns no historical rows.
+            return {
+                points: [
+                    { ts: new Date(b.startMs).toISOString(), t: b.startMs, up: upPct },
+                    { ts: new Date(b.endMs).toISOString(), t: b.endMs, up: upPct },
+                ],
+                ...b,
+            };
+        }
+        const b = rangeBounds(rangeKey);
+        const window = normalized.filter((p)=>p.t >= b.startMs && p.t <= (b.endMs + 60 * 1000));
+        if (window.length >= 2) return { points: window, ...b };
+        if (window.length === 1) return { points: [window[0], { ...window[0], t: b.endMs, up: upPct }], ...b };
+        const last = normalized[normalized.length - 1];
+        return last
+            ? { points: [{ ...last, t: b.startMs, up: last.up }, { ...last, t: b.endMs, up: upPct }], ...b }
+            : { points: [], ...b };
+    }
+
+    function labelFor(ts, rangeKey){
+        const d = new Date(ts);
+        const opts = { timeZone: (userTimezone || 'America/Los_Angeles') };
+        if (rangeKey === '3H' || rangeKey === '1H' || rangeKey === '30M' || rangeKey === '10M' || rangeKey === '1M') {
+            return d.toLocaleTimeString([], { ...opts, hour:'numeric', minute:'2-digit' });
+        }
+        return d.toLocaleTimeString([], { ...opts, hour:'numeric' }).replace(':00','');
+    }
+
+    function hoverTime(ts){
+        return new Date(ts).toLocaleString([], { timeZone: (userTimezone || 'America/Los_Angeles'), month:'short', day:'numeric', hour:'numeric', minute:'2-digit' });
+    }
+
+    function chartMarkup(data, rangeKey, bounds){
+        const m = data.length;
+        const startMs = Number(bounds?.startMs || Date.now() - 3600000);
+        const endMs = Math.max(startMs + 1000, Number(bounds?.endMs || Date.now()));
+        const xForTs = (ts)=>{
+            const t = Math.max(startMs, Math.min(endMs, Number(ts) || startMs));
+            const ratio = (t - startMs) / Math.max(1, endMs - startMs);
+            return Math.round(PAD_L + ratio * (W - PAD_L - PAD_R));
+        };
+        const path = m ? data.map((p, i)=>`${i===0?'M':'L'}${xForTs(p.t)},${toY(p.up)}`).join(' ') : '';
+        const lastX = m ? xForTs(data[m - 1].t) : xForTs(endMs);
+        const lastY = m ? toY(data[m - 1].up) : toY(upPct);
+        const ticks = [0, .2, .4, .6, .8, 1].map((r)=>{
+            const ts = startMs + r * (endMs - startMs);
+            return labelFor(ts, rangeKey);
+        });
+        return `
+            <div class="ym-graph-stage" id="ym-graph-stage">
+                <svg class="ym-graph" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-label="Market probability graph">
+                    <line x1="${PAD_L}" y1="${toY(100)}" x2="${W-PAD_R}" y2="${toY(100)}" class="ym-grid"></line>
+                    <line x1="${PAD_L}" y1="${toY(80)}" x2="${W-PAD_R}" y2="${toY(80)}" class="ym-grid"></line>
+                    <line x1="${PAD_L}" y1="${toY(60)}" x2="${W-PAD_R}" y2="${toY(60)}" class="ym-grid"></line>
+                    <line x1="${PAD_L}" y1="${toY(40)}" x2="${W-PAD_R}" y2="${toY(40)}" class="ym-grid"></line>
+                    <line x1="${PAD_L}" y1="${toY(20)}" x2="${W-PAD_R}" y2="${toY(20)}" class="ym-grid"></line>
+                    <line x1="${PAD_L}" y1="${toY(0)}" x2="${W-PAD_R}" y2="${toY(0)}" class="ym-grid"></line>
+                    ${path ? `<path d="${path}" class="ym-line up"></path>` : ''}
+                    <circle cx="${lastX}" cy="${lastY}" r="3.4" class="ym-point"></circle>
+                    <text x="${W-PAD_R+8}" y="${toY(100)+4}" class="ym-ylabel">100%</text>
+                    <text x="${W-PAD_R+8}" y="${toY(80)+4}" class="ym-ylabel">80%</text>
+                    <text x="${W-PAD_R+8}" y="${toY(60)+4}" class="ym-ylabel">60%</text>
+                    <text x="${W-PAD_R+8}" y="${toY(40)+4}" class="ym-ylabel">40%</text>
+                    <text x="${W-PAD_R+8}" y="${toY(20)+4}" class="ym-ylabel">20%</text>
+                    <text x="${W-PAD_R+8}" y="${toY(0)+4}" class="ym-ylabel">0%</text>
+                </svg>
+                <div class="ym-hover-line hidden" id="ym-hover-line"></div>
+                <div class="ym-hover-dot hidden" id="ym-hover-dot"></div>
+                <div class="ym-tooltip hidden" id="ym-tooltip"></div>
+            </div>
+            <div class="ym-xlabels">
+                <span>${ticks[0]}</span>
+                <span>${ticks[1]}</span>
+                <span>${ticks[2]}</span>
+                <span>${ticks[3]}</span>
+                <span>${ticks[4]}</span>
+                <span>${ticks[5]}</span>
+            </div>
+            <div class="ym-axis-caption">Market day starts ${ticks[0]}</div>
+        `;
+    }
+
+    host.innerHTML = `
+        <div class="yahoo-market-card yahoo-graph-card">
+            <div class="ym-brand-row">
+                <a class="ym-brand" href="${marketUrl}" target="_blank" rel="noopener" aria-label="Open Polymarket">
+                    <span>Polymarket</span>
+                </a>
+                <a class="ym-market-link" href="${marketUrl}" target="_blank" rel="noopener">View Market <span aria-hidden="true">›</span></a>
+            </div>
+            <div class="ym-market-title-row">
+                <span class="ym-bitcoin" aria-hidden="true">₿</span>
+                <a class="ym-market-title" href="${marketUrl}" target="_blank" rel="noopener">${title}</a>
+            </div>
+            <div class="ym-topline">
+                <div class="ym-legend">
+                    <span class="ym-dot"></span>
+                    <span class="ym-main" id="ym-main">${upPct.toFixed(0)}% chance</span>
+                    <span class="ym-delta pos" id="ym-delta">+0.0%</span>
+                </div>
+                <div class="ym-ranges">
+                    <button type="button" data-range="MKT">MKT</button>
+                    <button type="button" data-range="3H">3H</button>
+                    <button type="button" data-range="1H">1H</button>
+                </div>
+            </div>
+            <div class="ym-mini-title">${title}</div>
+            <div class="ym-graph-wrap" id="ym-graph-wrap"></div>
+        </div>
+    `;
+
+    const graphWrap = host.querySelector('#ym-graph-wrap');
+    const main = host.querySelector('#ym-main');
+    const deltaEl = host.querySelector('#ym-delta');
+    const buttons = Array.from(host.querySelectorAll('.ym-ranges button'));
+
+    function bindHover(data, bounds){
+        const stage = graphWrap?.querySelector('#ym-graph-stage');
+        const line = graphWrap?.querySelector('#ym-hover-line');
+        const dot = graphWrap?.querySelector('#ym-hover-dot');
+        const tip = graphWrap?.querySelector('#ym-tooltip');
+        if (!stage || !line || !dot || !tip || !data.length) return;
+
+        const startMs = Number(bounds?.startMs || Date.now() - 3600000);
+        const endMs = Math.max(startMs + 1000, Number(bounds?.endMs || Date.now()));
+        const xForTs = (ts)=>{
+            const t = Math.max(startMs, Math.min(endMs, Number(ts) || startMs));
+            const ratio = (t - startMs) / Math.max(1, endMs - startMs);
+            return Math.round(PAD_L + ratio * (W - PAD_L - PAD_R));
+        };
+        const hideHover = ()=>{
+            line.classList.add('hidden');
+            dot.classList.add('hidden');
+            tip.classList.add('hidden');
+        };
+        const showHover = (evt)=>{
+            const rect = stage.getBoundingClientRect();
+            if (!rect.width || !rect.height) return;
+            const plotLeft = (PAD_L / W) * rect.width;
+            const plotRight = ((W - PAD_R) / W) * rect.width;
+            const x = Math.max(plotLeft, Math.min(plotRight, evt.clientX - rect.left));
+            let nearest = 0;
+            let nearestDist = Infinity;
+            for (let i = 0; i < data.length; i++){
+                const px = (xForTs(data[i].t) / W) * rect.width;
+                const d = Math.abs(px - x);
+                if (d < nearestDist){
+                    nearest = i;
+                    nearestDist = d;
+                }
+            }
+            const p = data[nearest];
+            const px = (xForTs(p.t) / W) * rect.width;
+            const py = (toY(p.up) / H) * rect.height;
+            const upValue = pctValue(p.up);
+            const stamp = hoverTime(p.t);
+
+            line.style.left = `${px}px`;
+            dot.style.left = `${px}px`;
+            dot.style.top = `${py}px`;
+            tip.textContent = `${stamp}  ${upValue.toFixed(2)}%`;
+            const tipPad = 12;
+            const tipWidth = Math.max(120, tip.offsetWidth || 140);
+            const left = Math.max(tipPad, Math.min(rect.width - tipWidth - tipPad, px - (tipWidth / 2)));
+            tip.style.left = `${left}px`;
+            tip.style.top = `8px`;
+
+            line.classList.remove('hidden');
+            dot.classList.remove('hidden');
+            tip.classList.remove('hidden');
+        };
+        stage.addEventListener('mousemove', showHover);
+        stage.addEventListener('mouseenter', showHover);
+        stage.addEventListener('mouseleave', hideHover);
+        stage.addEventListener('touchstart', (evt)=> showHover(evt.touches[0]), { passive:true });
+        stage.addEventListener('touchmove', (evt)=> showHover(evt.touches[0]), { passive:true });
+        stage.addEventListener('touchend', hideHover);
+    }
+
+    const renderRange = (rangeKey)=>{
+        const ranged = pointsForRange(rangeKey);
+        const data = ranged.points;
+        const first = data.length ? pctValue(data[0].up) : upPct;
+        const last = data.length ? pctValue(data[data.length-1].up) : upPct;
+        const dlt = last - first;
+        if (main) main.textContent = `Up ${last.toFixed(0)}% chance`;
+        if (deltaEl){
+            deltaEl.textContent = `${dlt >= 0 ? '+' : ''}${dlt.toFixed(1)}%`;
+            deltaEl.classList.toggle('pos', dlt >= 0);
+            deltaEl.classList.toggle('neg', dlt < 0);
+        }
+        if (graphWrap) {
+            graphWrap.innerHTML = chartMarkup(data, rangeKey, ranged);
+            bindHover(data, ranged);
+        }
+        buttons.forEach((b)=> b.classList.toggle('active', b.dataset.range === rangeKey));
+        marketRangePreference = rangeKey;
+    };
+
+    buttons.forEach((b)=> b.addEventListener('click', ()=> renderRange(b.dataset.range || 'MKT')));
+    const allowed = new Set(['MKT', '3H', '1H']);
+    renderRange(allowed.has(preferredRange) ? preferredRange : 'MKT');
+}
+
+function stopMarketLiveUpdates(){
+    if (marketLiveTimer){
+        clearInterval(marketLiveTimer);
+        marketLiveTimer = null;
+    }
+    marketSeriesLastRefreshMs = 0;
+}
+
+async function fetchLocalMarketSeries(active, slug){
+    const activeDate = String(active?.date || '');
+    const [dayResp, curResp, gammaEvent] = await Promise.all([
+        fetch(`/api/prices/day?date=${encodeURIComponent(activeDate)}`, { headers: authHeaders() }),
+        fetch('/api/prices/current', { headers: authHeaders() }),
+        fetchPolymarketEventBySlug(slug).catch(() => null),
+    ]);
+    if (!dayResp.ok || !curResp.ok) return null;
+    const day = await dayResp.json().catch(()=>({}));
+    const merged = {
+        points: (Array.isArray(day?.points) ? day.points : []),
+    };
+    const cur = await curResp.json().catch(()=>({}));
+    const gammaCur = currentFromGammaEvent(gammaEvent, slug);
+    const bestCur = preferBestCurrent(cur, gammaCur);
+    if (!currentLooksUsable(bestCur)) {
+        throw new Error('Missing current market price from both local and Gamma sources');
+    }
+    const activeWithGamma = applyGammaEventToActive(active, gammaEvent, slug);
+    return { merged, cur: bestCur, active: activeWithGamma };
+}
+
+async function renderPolymarketFallback(host, slug){
+    const scriptSrc = 'https://embed.polymarket.com';
+    let script = document.querySelector(`script[src="${scriptSrc}"]`);
+    if (!script) {
+        script = document.createElement('script');
+        script.type = 'module';
+        script.src = scriptSrc;
+        document.head.appendChild(script);
+    }
+    if (!customElements.get('polymarket-market-embed')) {
+        // Do not wait forever if the script/CORS/network blocks.
+        await Promise.race([
+            customElements.whenDefined('polymarket-market-embed'),
+            new Promise((_, reject)=> setTimeout(()=> reject(new Error('Polymarket embed definition timeout')), 3000)),
+        ]);
+    }
+    const embed = document.createElement('polymarket-market-embed');
+    embed.setAttribute('market', slug);
+    embed.setAttribute('theme', 'dark');
+    embed.setAttribute('width', '392');
+    embed.setAttribute('height', '180');
+    embed.style.width = '100%';
+    embed.style.height = '180px';
+    embed.style.maxWidth = '392px';
+    embed.style.minHeight = '180px';
+    embed.style.display = 'block';
+    embed.setAttribute('role', 'img');
+    embed.setAttribute('aria-label', 'Bitcoin prediction market chart from Polymarket');
+    host.innerHTML = '';
+    host.appendChild(embed);
+}
+
+        // Custom prediction-market card first; plain Polymarket embed is last-resort fallback.
+async function updateLegacyPolymarketEmbed(opts = {}) {
+    const showLoading = opts.showLoading !== false;
+    const setupLive = opts.setupLive !== false;
+    const allowFastPath = opts.allowFastPath !== false;
+    if (marketEmbedInFlight && !showLoading){
+        return;
+    }
+    marketEmbedInFlight = true;
     try {
         const host = document.getElementById('polymarket-embed-host');
         if (!host) return;
-
-        // Prevent layout shifts by setting stable dimensions immediately
         host.style.width = '100%';
-        host.style.maxWidth = '392px';
-        host.style.height = '180px';
-        host.style.minHeight = '180px';
+        host.style.maxWidth = '100%';
+        host.style.height = '400px';
+        host.style.minHeight = '400px';
         host.style.display = 'flex';
         host.style.alignItems = 'center';
         host.style.justifyContent = 'center';
         host.style.position = 'relative';
         host.style.overflow = 'hidden';
         host.style.margin = '0 auto';
-        host.style.backgroundColor = '#1a1a1a';
+        host.style.backgroundColor = 'var(--panel)';
         host.style.borderRadius = '8px';
 
-        // Check if we already have an embed to prevent unnecessary reloads
-        const existingEmbed = host.querySelector('polymarket-market-embed');
-        if (existingEmbed) return;
+        if (showLoading){
+            setMarketHostLoading(host);
+        } else {
+            clearMarketLoadingState(host);
+        }
 
-        // Show skeleton loader that matches final dimensions
-        host.innerHTML = `
-            <div style="
-                width: 100%;
-                height: 100%;
-                background: linear-gradient(90deg, #2a2a2a 25%, #3a3a3a 50%, #2a2a2a 75%);
-                background-size: 200% 100%;
-                animation: skeleton-loading 1.5s infinite;
-                border-radius: 8px;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                color: #666;
-                font-size: 14px;
-            ">Loading market...</div>
-            <style>
-                @keyframes skeleton-loading {
-                    0% { background-position: 200% 0; }
-                    100% { background-position: -200% 0; }
+        const seriesStale = !marketSeriesLastRefreshMs || (Date.now() - marketSeriesLastRefreshMs >= MARKET_SERIES_REFRESH_MS);
+        if (!showLoading && !setupLive && allowFastPath && !seriesStale && marketSeriesCache?.active && marketSeriesCache?.slug && marketSeriesCache?.merged){
+            const curResp = await fetch('/api/prices/current', { headers: authHeaders() });
+            if (curResp.ok){
+                const cur = await curResp.json().catch(()=>({}));
+                if (currentLooksUsable(cur)) {
+                    const liveSeries = withLatestCurrentPoint(marketSeriesCache.merged, cur);
+                    renderLocalGraphCard(host, marketSeriesCache.slug, marketSeriesCache.active, liveSeries, cur, marketRangePreference);
+                    return;
                 }
-            </style>
-        `;
-
-        // Load the script if not already loaded
-        if (!document.querySelector('script[src="https://embed.polymarket.com"]')) {
-            const script = document.createElement('script');
-            script.type = 'module';
-            script.src = 'https://embed.polymarket.com';
-            document.head.appendChild(script);
+            }
         }
 
-        // Wait for the custom element to be defined
-        if (!customElements.get('polymarket-market-embed')) {
-            await customElements.whenDefined('polymarket-market-embed').catch(() => {});
+        const activeResp = await fetch('/api/active-market', { headers: authHeaders() });
+        if (!activeResp.ok){
+            stopMarketLiveUpdates();
+            await ensureMarketLoaderVisible(host, showLoading);
+            host.innerHTML = '<div class="market-error">Market unavailable</div>';
+            clearMarketLoadingState(host);
+            return;
         }
-
-        // Get the market data
-        const response = await fetch('/api/active-market', { headers: authHeaders() });
-        if (!response.ok) {
-            host.innerHTML = '<div style="color: #999; font-size: 14px; height: 100%; display: flex; align-items: center; justify-content: center;">Market unavailable</div>';
+        const active = await activeResp.json();
+        const slug = active?.market?.slug;
+        if (!slug){
+            stopMarketLiveUpdates();
+            await ensureMarketLoaderVisible(host, showLoading);
+            host.innerHTML = '<div class="market-error">No market data</div>';
+            clearMarketLoadingState(host);
             return;
         }
 
-        const data = await response.json();
-        const slug = data.market?.slug;
-        if (!slug) {
-            host.innerHTML = '<div style="color: #999; font-size: 14px; height: 100%; display: flex; align-items: center; justify-content: center;">No market data</div>';
-            return;
+        let renderedYahoo = false;
+        let localRenderError = null;
+
+        if (!renderedYahoo){
+            try{
+                const local = await fetchLocalMarketSeries(active, slug);
+                if (local){
+                    await ensureMarketLoaderVisible(host, showLoading);
+                    marketSeriesCache = { active: local.active || active, slug, merged: local.merged };
+                    marketSeriesLastRefreshMs = Date.now();
+                    const liveSeries = withLatestCurrentPoint(local.merged, local.cur);
+                    renderLocalGraphCard(host, slug, local.active || active, liveSeries, local.cur, marketRangePreference);
+                    clearMarketLoadingState(host);
+                    if (setupLive){
+                        stopMarketLiveUpdates();
+                        marketLiveTimer = setInterval(()=>{
+                            updateLegacyPolymarketEmbed({ showLoading:false, setupLive:false }).catch(()=>{});
+                        }, Math.max(1000, MARKET_LIVE_REFRESH_MS));
+                    }
+                    renderedYahoo = true;
+                }
+            } catch (err) {
+                localRenderError = err;
+            }
         }
 
-        // Create the embed with exact same dimensions as container
-        const embed = document.createElement('polymarket-market-embed');
-        embed.setAttribute('market', slug);
-        embed.setAttribute('theme', 'dark');
-        embed.setAttribute('width', '392');
-        embed.setAttribute('height', '180');
-        embed.style.width = '100%';
-        embed.style.height = '180px';
-        embed.style.maxWidth = '392px';
-        embed.style.minHeight = '180px';
-        embed.style.display = 'block';
-
-        // Add accessibility attributes
-        embed.setAttribute('role', 'img');
-        embed.setAttribute('aria-label', 'Bitcoin prediction market chart from Polymarket');
-
-        // Replace content without changing container dimensions
-        host.innerHTML = '';
-        host.appendChild(embed);
-
-        // Fix any empty links that might be created by the embed
-        setTimeout(() => {
-            const emptyLinks = host.querySelectorAll('a:not([aria-label]):not([title]):empty, a[href]:not([aria-label]):not([title])');
-            emptyLinks.forEach(link => {
-                if (!link.textContent?.trim()) {
-                    link.setAttribute('aria-label', 'View market on Polymarket');
-                    link.setAttribute('title', 'View market on Polymarket');
-                }
-            });
-        }, 1000);
-
+        if (!renderedYahoo){
+            stopMarketLiveUpdates();
+            await ensureMarketLoaderVisible(host, showLoading);
+            try {
+                await renderPolymarketFallback(host, slug);
+            } catch (fallbackErr) {
+                const reason = localRenderError?.message || fallbackErr?.message || 'Unknown error';
+                host.innerHTML = `<div class="market-error">Market load failed: ${reason}</div>`;
+            } finally {
+                clearMarketLoadingState(host);
+            }
+        }
     } catch (error) {
-        console.error('Failed to load Polymarket embed:', error);
+        console.error('Failed to load market card:', error);
+        stopMarketLiveUpdates();
         const host = document.getElementById('polymarket-embed-host');
-        if (host) {
-            host.innerHTML = '<div style="color: #999; font-size: 14px; height: 100%; display: flex; align-items: center; justify-content: center;">Failed to load market</div>';
+        if (host){
+            await ensureMarketLoaderVisible(host, showLoading);
+            host.innerHTML = '<div class="market-error">Failed to load market</div>';
+            clearMarketLoadingState(host);
         }
+    } finally {
+        marketEmbedInFlight = false;
     }
+}
+
+function renderOfficialPolymarketEmbed(host, active){
+    const slug = String(active?.market?.slug || '').trim();
+    if (!slug) throw new Error('Active market slug unavailable');
+    const title = String(
+        active?.market?.question ||
+        active?.market?.title ||
+        'BTC Up or Down Daily'
+    ).trim();
+    const marketUrl = `https://polymarket.com/event/${encodeURIComponent(slug)}`;
+    const embedUrl = new URL('https://embed.polymarket.com/market');
+    embedUrl.searchParams.set('market', slug);
+    embedUrl.searchParams.set('theme', 'dark');
+    embedUrl.searchParams.set('volume', 'false');
+    embedUrl.searchParams.set('buttons', 'false');
+    embedUrl.searchParams.set('border', 'false');
+    // The 2px dark mask on each side belongs to the outer figure, so the
+    // iframe's requested viewport is four pixels narrower than its host.
+    const embedWidth = Math.round(Math.min(1000, Math.max(320, (host.clientWidth || 904) - 4)));
+    const embedHeight = embedWidth >= 760 ? 440 : (embedWidth >= 520 ? 420 : 400);
+    embedUrl.searchParams.set('width', String(embedWidth));
+    embedUrl.searchParams.set('height', String(embedHeight));
+
+    const figure = document.createElement('figure');
+    figure.className = 'polymarket-embed official-polymarket-embed';
+    figure.id = `polymarket-${slug}`;
+    figure.setAttribute('aria-label', `Polymarket prediction market: ${title}`);
+    figure.setAttribute('itemscope', '');
+    figure.setAttribute('itemtype', 'https://schema.org/WebPage');
+    figure.style.setProperty('--embed-height', `${embedHeight}px`);
+
+    const iframe = document.createElement('iframe');
+    iframe.title = `${title} — Polymarket Prediction Market`;
+    iframe.src = embedUrl.toString();
+    iframe.width = String(embedWidth);
+    iframe.height = String(embedHeight);
+    iframe.setAttribute('frameborder', '0');
+    iframe.setAttribute('allowtransparency', 'true');
+    iframe.setAttribute('loading', 'eager');
+    iframe.setAttribute('scrolling', 'no');
+
+    const makeEmbedLink = (className, label) => {
+        const anchor = document.createElement('a');
+        anchor.href = marketUrl;
+        anchor.target = '_blank';
+        anchor.rel = 'noopener';
+        anchor.className = `polymarket-embed-link ${className}`;
+        anchor.setAttribute('aria-label', label);
+        return anchor;
+    };
+    const brandLink = makeEmbedLink('polymarket-embed-brand-link', 'Open Polymarket');
+    const titleLink = makeEmbedLink('polymarket-embed-title-link', `Open ${title} on Polymarket`);
+    const link = makeEmbedLink('polymarket-embed-view-link', 'View market on Polymarket');
+
+    const caption = document.createElement('figcaption');
+    caption.className = 'sr-only';
+    caption.textContent = `${title}. View full market and trade on Polymarket.`;
+
+    figure.append(iframe, brandLink, titleLink, link, caption);
+    host.replaceChildren(figure);
+
+    let structured = document.getElementById('polymarket-market-structured-data');
+    if (!structured){
+        structured = document.createElement('script');
+        structured.id = 'polymarket-market-structured-data';
+        structured.type = 'application/ld+json';
+        document.head.appendChild(structured);
+    }
+    structured.textContent = JSON.stringify({
+        '@context': 'https://schema.org',
+        '@type': 'WebPage',
+        name: title,
+        description: `Prediction market: ${title} on Polymarket.`,
+        url: marketUrl,
+        publisher: {
+            '@type': 'Organization',
+            name: 'Polymarket',
+            url: 'https://polymarket.com',
+        },
+    });
+}
+
+async function updatePolymarketEmbed(opts = {}) {
+    return updateLegacyPolymarketEmbed(opts);
 }
 
 // User page
@@ -697,6 +1404,7 @@ async function loadUserData(){
     if (userPage) {
         userPage.setAttribute('data-loading', 'true');
     }
+    stopMarketLiveUpdates();
 
     try {
         // Start status and market embed in parallel so neither blocks the other
@@ -776,8 +1484,18 @@ async function loadUserData(){
             opt.textContent=labelForAccount(a);
             sel.appendChild(opt);
         });
-        if (sel.options.length){ sel.value = sel.options[0].value; await loadTrades(sel.value); }
-        sel.onchange = ()=> loadTrades(sel.value);
+        initUserAccountMenu();
+        if (sel.options.length){
+            sel.value = sel.options[0].value;
+            syncUserAccountMenuFromSelect();
+            await loadTrades(sel.value);
+        } else {
+            syncUserAccountMenuFromSelect();
+        }
+        sel.onchange = ()=>{
+            syncUserAccountMenuFromSelect();
+            loadTrades(sel.value);
+        };
     }
     // Ensure the parallel tasks finish before we complete load
     await Promise.allSettled([statsPromise, embedPromise]);
@@ -798,33 +1516,56 @@ async function loadUserStats() {
     const statusText = document.getElementById('status-text');
     const totalProfitElement = document.getElementById('user-total-profit');
     const currentStakeElement = document.getElementById('user-current-stake');
+    const safeBalanceElement = document.getElementById('user-safe-balance');
 
-    console.log('🔄 loadUserStats() called');
+    console.log('[loadUserStats] called');
+    if (statusIndicator) {
+        statusIndicator.textContent = '';
+        statusIndicator.style.display = 'none';
+    }
+    const botStatus = document.getElementById('user-bot-status');
+    if (botStatus) {
+        botStatus.classList.add('loading-text');
+    }
+    if (statusText) {
+        statusText.textContent = '';
+        statusText.setAttribute('aria-label', 'Loading');
+        statusText.classList.remove('loading-inline');
+    }
+    [totalProfitElement, currentStakeElement, safeBalanceElement]
+        .forEach((el)=>{
+            if (!el) return;
+            el.classList.add('loading-text');
+            el.textContent = '';
+            el.setAttribute('aria-label', 'Loading');
+        });
 
     try {
         // Kick off both requests concurrently
-        console.log('📡 Fetching user profile & summary in parallel...');
+        console.log('[loadUserStats] Fetching profile and summary in parallel...');
         const profilePromise = fetch('/api/user/profile', { headers: authHeaders() });
         const summaryPromise = fetch('/api/user/summary', { headers: authHeaders() });
 
         // Await profile first to set status ASAP
         const profileResponse = await profilePromise;
-        console.log('📡 Profile response status:', profileResponse.status);
+        console.log('[loadUserStats] Profile response status:', profileResponse.status);
         if (!profileResponse.ok) throw new Error(`Profile API failed: ${profileResponse.status}`);
         const profile = await profileResponse.json();
-        console.log('✅ Profile loaded:', profile);
+        console.log('[loadUserStats] Profile loaded:', profile);
 
         // Now handle summary without blocking status
         try {
             const summaryResponse = await summaryPromise;
             const summary = summaryResponse.ok ? await summaryResponse.json() : {};
-            console.log('✅ Summary loaded:', summary);
+            console.log('[loadUserStats] Summary loaded:', summary);
             // Update total profit
             if (totalProfitElement && summary.total_profit !== undefined) {
                 const profit = parseFloat(summary.total_profit) || 0;
                 totalProfitElement.textContent = `$${profit.toFixed(2)}`;
-                totalProfitElement.className = profit >= 0 ? 'positive' : 'negative';
-                console.log('💰 Profit updated:', profit);
+                totalProfitElement.removeAttribute('aria-label');
+                totalProfitElement.classList.remove('positive', 'negative');
+                totalProfitElement.classList.add(profit >= 0 ? 'positive' : 'negative');
+                console.log('[loadUserStats] Profit updated:', profit);
             }
             // Update current stake (position value)
             if (currentStakeElement && summary.mark) {
@@ -832,8 +1573,17 @@ async function loadUserStats() {
                 const downValue = summary.mark.DOWN || 0;
                 const totalValue = upValue + downValue;
                 currentStakeElement.textContent = `$${totalValue.toFixed(2)}`;
-                console.log('📊 Stake updated:', totalValue);
+                currentStakeElement.removeAttribute('aria-label');
+                console.log('[loadUserStats] Stake updated:', totalValue);
             }
+            if (safeBalanceElement) {
+                const raw = Number(summary.safe_balance ?? summary.holdings_value ?? 0);
+                const safeBal = Number.isFinite(raw) ? raw : 0;
+                safeBalanceElement.textContent = `$${safeBal.toFixed(2)}`;
+                safeBalanceElement.removeAttribute('aria-label');
+            }
+            [totalProfitElement, currentStakeElement, safeBalanceElement]
+                .forEach((el)=> el && el.classList.remove('loading-text'));
         } catch (e) {
             console.warn('Summary load failed or incomplete:', e);
         }
@@ -841,30 +1591,56 @@ async function loadUserStats() {
         // Update trading status based on user's pause setting
         if (statusIndicator && statusText) {
             const isPaused = profile.paused === true;
-            console.log('🎯 User paused status:', isPaused, 'from profile:', profile.paused);
+            console.log('[loadUserStats] User paused status:', isPaused, 'from profile:', profile.paused);
+            statusIndicator.style.display = '';
+            statusIndicator.textContent = '●';
 
             if (isPaused) {
                 statusIndicator.className = 'status-indicator paused';
                 statusText.textContent = 'Paused';
-                console.log('⏸️ Status set to Paused');
+                statusText.removeAttribute('aria-label');
+                statusText.classList.remove('loading-inline');
+                if (botStatus) {
+                    botStatus.classList.remove('loading-text');
+                }
+                console.log('[loadUserStats] Status set to Paused');
             } else {
                 statusIndicator.className = 'status-indicator running';
                 statusText.textContent = 'Active';
-                console.log('▶️ Status set to Active');
+                statusText.removeAttribute('aria-label');
+                statusText.classList.remove('loading-inline');
+                if (botStatus) {
+                    botStatus.classList.remove('loading-text');
+                }
+                console.log('[loadUserStats] Status set to Active');
             }
         } else {
-            console.error('❌ Status elements not found');
+            console.error('[loadUserStats] Status elements not found');
         }
 
     } catch (error) {
-        console.error('❌ Error loading user stats:', error);
+        console.error('[loadUserStats] Error loading user stats:', error);
 
         // Set fallback values with proper error handling
         if (totalProfitElement) totalProfitElement.textContent = '$0.00';
         if (currentStakeElement) currentStakeElement.textContent = '$0.00';
+        if (safeBalanceElement) safeBalanceElement.textContent = '$0.00';
+        if (totalProfitElement) totalProfitElement.removeAttribute('aria-label');
+        if (currentStakeElement) currentStakeElement.removeAttribute('aria-label');
+        if (safeBalanceElement) safeBalanceElement.removeAttribute('aria-label');
+        if (statusText) {
+            statusText.removeAttribute('aria-label');
+            statusText.classList.remove('loading-inline');
+        }
+        if (statusIndicator) statusIndicator.style.display = '';
+        if (botStatus) {
+            botStatus.classList.remove('loading-text');
+        }
+        [totalProfitElement, currentStakeElement, safeBalanceElement]
+            .forEach((el)=> el && el.classList.remove('loading-text'));
 
         // Keep default "Active" status on error
-        console.log('🔄 Keeping default Active status due to error');
+        console.log('[loadUserStats] Keeping default Active status due to error');
     }
 }
 
@@ -917,7 +1693,12 @@ async function loadTrades(name){
     for (const r of arr){
         const tr = document.createElement('tr');
         const tdTime = document.createElement('td'); tdTime.textContent = fmtShortTime(r.ts);
-        const tdEv = document.createElement('td'); tdEv.textContent = mapEvent(r.event);
+        const eventLabel = mapEvent(r.event);
+        const tdEv = document.createElement('td');
+        const eventPill = document.createElement('span');
+        eventPill.className = `trade-event trade-event-${eventLabel.replace(/\s+/g, '-')}`;
+        eventPill.textContent = eventLabel;
+        tdEv.appendChild(eventPill);
         const tdSz = document.createElement('td'); tdSz.textContent = (Number(r.size)||0).toFixed(4);
         const tdPx = document.createElement('td'); tdPx.textContent = (Number(r.price)||0).toFixed(2);
         const tdUsd = document.createElement('td'); tdUsd.textContent = (Number(r.size||0)*Number(r.price||0)).toFixed(2);
@@ -1000,7 +1781,7 @@ function ensureUserChart(){
             }catch{}
         };
         tick();
-        userLiveTimer = setInterval(tick, 5000);
+        userLiveTimer = setInterval(tick, 58000);
     }
 
 // Removed day-picker and live button code (no longer part of the UI)
@@ -1061,12 +1842,75 @@ function currentAbbrForIana(tz){
 }
 function populateTimezones(){
     const sel = $('#pf-timezone'); if (!sel) return;
+    const menu = $('#pf-timezone-menu');
     sel.innerHTML = '';
+    if (menu) menu.innerHTML = '';
     ['PST','MST','CST','EST'].forEach(ab=>{
         const opt=document.createElement('option'); opt.value=ab; opt.textContent=ab; sel.appendChild(opt);
+        if (menu){
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'tz-option';
+            btn.dataset.value = ab;
+            btn.setAttribute('role', 'option');
+            btn.textContent = ab;
+            btn.addEventListener('click', ()=>{
+                setTimezoneUIValue(ab);
+                closeTimezoneMenu();
+            });
+            menu.appendChild(btn);
+        }
+    });
+}
+
+function setTimezoneUIValue(value){
+    const val = String(value || 'PST');
+    const sel = $('#pf-timezone');
+    if (sel) sel.value = val;
+    const label = $('#pf-timezone-btn-label');
+    if (label) label.textContent = val;
+    $$('.tz-option').forEach((el)=>{
+        el.classList.toggle('active', el.dataset.value === val);
+        el.setAttribute('aria-selected', el.dataset.value === val ? 'true' : 'false');
+    });
+}
+
+function closeTimezoneMenu(){
+    const menu = $('#pf-timezone-menu');
+    const btn = $('#pf-timezone-btn');
+    if (menu) menu.classList.add('hidden');
+    if (btn){
+        btn.classList.remove('open');
+        btn.setAttribute('aria-expanded', 'false');
+    }
+}
+
+function initTimezoneMenu(){
+    const btn = $('#pf-timezone-btn');
+    const menu = $('#pf-timezone-menu');
+    if (!btn || !menu || btn.dataset.bound === '1') return;
+    btn.dataset.bound = '1';
+    btn.addEventListener('click', (e)=>{
+        e.preventDefault();
+        const open = menu.classList.contains('hidden');
+        if (open){
+            menu.classList.remove('hidden');
+            btn.classList.add('open');
+            btn.setAttribute('aria-expanded', 'true');
+        } else {
+            closeTimezoneMenu();
+        }
+    });
+    document.addEventListener('click', (e)=>{
+        if (menu.classList.contains('hidden')) return;
+        if (!menu.contains(e.target) && !btn.contains(e.target)){
+            closeTimezoneMenu();
+        }
     });
 }
 populateTimezones();
+initTimezoneMenu();
+setTimezoneUIValue('PST');
 
 async function loadProfile(){
     const r = await fetch('/api/user/profile', {headers: authHeaders()});
@@ -1074,103 +1918,1063 @@ async function loadProfile(){
     const js = await r.json();
     const uname = js.username || '';
     $('#pf-username-view').textContent = uname;
-    $('#pf-paused').checked = !!js.paused;
     const abbr = currentAbbrForIana(js.timezone || userTimezone);
     const base = (abbr||'').replace('DT','ST');
     const sel = document.getElementById('pf-timezone');
-    if (sel){ sel.value = ['PST','MST','CST','EST'].includes(base) ? base : 'PST'; }
-    // Private key hint (do not expose full key)
-    const pkInput = $('#pf-privkey');
-    if (js.has_private_key){
-        // Always show beginning: 0x + first 4 hex; if we only got an ending like "...8026",
-        // we still show a generic 0x•••• to avoid implying exact tail.
-        let hint = js.private_key_hint || '';
-        let display = '0x' + '••••';
-        // If the server provided an ellipsis (e.g., ...8026), don't infer prefix; mask instead
-        if (!hint.includes('...')) {
-            // Prefer an actual starting 0x prefix with at least 4 hex characters
-            const mStart = hint.match(/^0x([0-9a-fA-F]{4,})/);
-            if (mStart) {
-                display = '0x' + mStart[1].slice(0,4);
-            } else if (/^[0-9a-fA-F]{4,}/.test(hint)) {
-                // Or a plain hex string starting at position 0
-                display = '0x' + hint.slice(0,4);
-            }
-        }
-        pkInput.placeholder = `Stored (${display})`;
-        pkInput.value = '';
-    } else {
-        pkInput.placeholder = '0x… (never shared)';
-        pkInput.value = '';
+    if (sel){
+        const nextTz = ['PST','MST','CST','EST'].includes(base) ? base : 'PST';
+        setTimezoneUIValue(nextTz);
     }
-    // Load delete button visibility
+    await loadMyTradingAccount();
     await loadProfileDeleteButton();
 }
+
+let tradingAccounts = [];
+let myTradingAccount = null;
+let adminDraggingAccountEl = null;
+let adminLastDragClientY = null;
+let adminDeleteTargetName = '';
+
+function setUserAccountUIValue(value){
+    const sel = document.getElementById('user-account');
+    const label = document.getElementById('user-account-btn-label');
+    const menu = document.getElementById('user-account-menu');
+    const v = String(value ?? '');
+    if (sel) sel.value = v;
+    if (label && sel){
+        const opt = Array.from(sel.options).find(o => o.value === v);
+        label.textContent = opt ? opt.textContent : 'All accounts';
+    }
+    if (menu){
+        Array.from(menu.querySelectorAll('.tz-option')).forEach((el)=>{
+            const active = el.dataset.value === v;
+            el.classList.toggle('active', active);
+            el.setAttribute('aria-selected', active ? 'true' : 'false');
+        });
+    }
+}
+
+function closeUserAccountMenu(){
+    const menu = document.getElementById('user-account-menu');
+    const btn = document.getElementById('user-account-btn');
+    if (menu) menu.classList.add('hidden');
+    if (btn){
+        btn.classList.remove('open');
+        btn.setAttribute('aria-expanded', 'false');
+    }
+}
+
+function syncUserAccountMenuFromSelect(){
+    const sel = document.getElementById('user-account');
+    const menu = document.getElementById('user-account-menu');
+    if (!sel || !menu) return;
+    menu.innerHTML = '';
+    Array.from(sel.options).forEach((opt)=>{
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'tz-option';
+        btn.dataset.value = opt.value;
+        btn.setAttribute('role', 'option');
+        btn.textContent = opt.textContent || opt.value;
+        btn.addEventListener('click', ()=>{
+            setUserAccountUIValue(opt.value);
+            closeUserAccountMenu();
+            loadTrades(opt.value);
+        });
+        menu.appendChild(btn);
+    });
+    setUserAccountUIValue(sel.value || '*');
+}
+
+function initUserAccountMenu(){
+    const btn = document.getElementById('user-account-btn');
+    const menu = document.getElementById('user-account-menu');
+    if (!btn || !menu || btn.dataset.bound === '1') return;
+    btn.dataset.bound = '1';
+    btn.addEventListener('click', (e)=>{
+        e.preventDefault();
+        const open = menu.classList.contains('hidden');
+        if (open){
+            menu.classList.remove('hidden');
+            btn.classList.add('open');
+            btn.setAttribute('aria-expanded', 'true');
+        } else {
+            closeUserAccountMenu();
+        }
+    });
+    document.addEventListener('click', (e)=>{
+        if (menu.classList.contains('hidden')) return;
+        if (!menu.contains(e.target) && !btn.contains(e.target)){
+            closeUserAccountMenu();
+        }
+    });
+}
+
+function fmtMetaDate(value){
+    if (!value) return 'n/a';
+    const d = new Date(value);
+    if (Number.isNaN(d.getTime())) return String(value);
+    return d.toLocaleString();
+}
+
+function safeTxServiceHostsForChain(chainIdDec){
+    const map = {
+        1: ['https://safe-transaction-mainnet.safe.global'],
+        10: ['https://safe-transaction-optimism.safe.global'],
+        56: ['https://safe-transaction-bsc.safe.global'],
+        100: ['https://safe-transaction-gnosis-chain.safe.global'],
+        137: ['https://safe-transaction-polygon.safe.global'],
+        42161: ['https://safe-transaction-arbitrum.safe.global'],
+        43114: ['https://safe-transaction-avalanche.safe.global'],
+        8453: ['https://safe-transaction-base.safe.global'],
+    };
+    const preferred = map[chainIdDec] || [];
+    const all = Array.from(new Set(Object.values(map).flat()));
+    return [...preferred, ...all.filter(h => !preferred.includes(h))];
+}
+
+async function detectSafesForOwner(owner, chainIdHex){
+    const ownerAddr = String(owner || '').trim();
+    if (!ownerAddr) return [];
+    const chainIdDec = Number.parseInt(String(chainIdHex || '0x89'), 16) || 137;
+    const r = await fetch(`/api/wallet/safes?owner=${encodeURIComponent(ownerAddr)}&chain_id=${encodeURIComponent(String(chainIdDec))}`, {
+        headers: authHeaders(),
+    });
+    const js = await r.json().catch(()=>({}));
+    if (!r.ok){
+        const detail = js?.detail || `HTTP ${r.status}`;
+        throw new Error(`Safe lookup failed: ${detail}`);
+    }
+    const raw = Array.isArray(js?.safes) ? js.safes : [];
+    const safes = raw
+        .map((s)=> typeof s === 'string' ? s : (s && typeof s === 'object' ? (s.address || s.value || '') : ''))
+        .map((s)=> String(s || '').trim())
+        .filter(Boolean);
+    if (!safes.length && Array.isArray(js?.checked_chains)){
+        throw new Error(`No Safe detected (checked chains: ${js.checked_chains.join(', ')})`);
+    }
+    return safes;
+}
+
+async function requestWalletAccount({ forcePrompt = false } = {}){
+    // Best-effort: force a fresh MetaMask permission prompt for eth_accounts.
+    if (forcePrompt){
+        try {
+            await window.ethereum.request({
+                method: 'wallet_revokePermissions',
+                params: [{ eth_accounts: {} }],
+            });
+        } catch (_) {}
+    }
+    try {
+        await window.ethereum.request({
+            method: 'wallet_requestPermissions',
+            params: [{ eth_accounts: {} }],
+        });
+    } catch (_) {}
+    const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
+    if (!Array.isArray(accounts) || !accounts.length || !accounts[0]){
+        throw new Error('No wallet account returned.');
+    }
+    return String(accounts[0]);
+}
+
+async function connectWalletAddress({ requireSafe = true, forcePrompt = false, allowSavedSafeFallback = true } = {}){
+    if (!window.ethereum || !window.ethereum.request){
+        throw new Error('No wallet found. Install MetaMask or a compatible wallet.');
+    }
+    const eoa = await requestWalletAccount({ forcePrompt });
+    const chainId = await window.ethereum.request({ method: 'eth_chainId' }).catch(()=>'0x89');
+    let safes = [];
+    try{
+        safes = await detectSafesForOwner(eoa, chainId);
+    } catch (err) {
+        if (requireSafe) throw err;
+        safes = [];
+    }
+    let safe = safes.length ? String(safes[0]) : null;
+    if (!safe && allowSavedSafeFallback){
+        // Fallback: use already-saved safe for this user if present.
+        try{
+            const existing = await fetch('/api/user/trading-account', { headers: authHeaders() });
+            if (existing.ok){
+                const js = await existing.json().catch(()=>({}));
+                const acct = js?.account || {};
+                const savedSafe = String(acct.safe_address || '').trim();
+                const savedOwner = String(acct.wallet_owner || '').trim();
+                if (savedSafe && (!savedOwner || savedOwner.toLowerCase() === eoa.toLowerCase())){
+                    safe = savedSafe;
+                }
+            }
+        } catch (_) {}
+    }
+    if (requireSafe && !safe){
+        throw new Error('No Safe detected for this wallet on supported chains. Select a wallet that owns a Safe.');
+    }
+    return { eoa, funder: safe || eoa, safe, safes, chainId };
+}
+
+async function updateMyTradingAccountRequest(body){
+    let last = null;
+    for (const method of ['POST', 'PATCH', 'PUT']){
+        const r = await fetch('/api/user/trading-account', {
+            method,
+            headers: {'Content-Type':'application/json', ...authHeaders()},
+            body: JSON.stringify(body),
+        });
+        if (r.status === 405){
+            last = r;
+            continue;
+        }
+        return r;
+    }
+    return last;
+}
+
+function profileFunderValue(){
+    // Backend funder should remain Safe/proxy address.
+    const el = $('#pf-tr-safe');
+    return (el?.dataset?.value || '').trim();
+}
+
+function profileWalletOwnerValue(){
+    const el = $('#pf-tr-funder');
+    return (el?.dataset?.value || '').trim();
+}
+
+function profileSafeValue(){
+    const el = $('#pf-tr-safe');
+    return (el?.dataset?.value || '').trim();
+}
+
+function enhanceSelect(select){
+    if (!select || select.dataset.enhancedSelect === '1') return;
+    select.dataset.enhancedSelect = '1';
+    select.classList.add('sr-only-select');
+
+    const shell = document.createElement('div');
+    shell.className = 'app-select';
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'app-select-btn';
+    button.setAttribute('aria-haspopup', 'listbox');
+    button.setAttribute('aria-expanded', 'false');
+    const valueLabel = document.createElement('span');
+    valueLabel.className = 'app-select-value';
+    const caret = document.createElement('span');
+    caret.className = 'tz-caret';
+    caret.setAttribute('aria-hidden', 'true');
+    button.append(valueLabel, caret);
+    const menu = document.createElement('div');
+    menu.className = 'app-select-menu hidden';
+    menu.setAttribute('role', 'listbox');
+    shell.append(button, menu);
+    select.parentNode.insertBefore(shell, select);
+    shell.appendChild(select);
+
+    const close = ()=>{
+        menu.classList.add('hidden');
+        button.classList.remove('open');
+        button.setAttribute('aria-expanded', 'false');
+    };
+    const sync = ()=>{
+        const selected = select.options[select.selectedIndex] || select.options[0];
+        valueLabel.textContent = selected?.textContent || '';
+        Array.from(menu.children).forEach((item)=>{
+            const active = item.dataset.value === select.value;
+            item.classList.toggle('active', active);
+            item.setAttribute('aria-selected', active ? 'true' : 'false');
+        });
+        button.disabled = select.disabled;
+    };
+    const rebuild = ()=>{
+        menu.innerHTML = '';
+        Array.from(select.options).forEach((option)=>{
+            const item = document.createElement('button');
+            item.type = 'button';
+            item.className = 'app-select-option';
+            item.dataset.value = option.value;
+            item.setAttribute('role', 'option');
+            item.textContent = option.textContent;
+            item.disabled = option.disabled;
+            item.addEventListener('click', ()=>{
+                select.value = option.value;
+                select.dispatchEvent(new Event('change', {bubbles:true}));
+                sync();
+                close();
+            });
+            menu.appendChild(item);
+        });
+        sync();
+    };
+    button.addEventListener('click', (event)=>{
+        event.preventDefault();
+        event.stopPropagation();
+        const opening = menu.classList.contains('hidden');
+        document.querySelectorAll('.app-select-menu:not(.hidden)').forEach((other)=>other.classList.add('hidden'));
+        document.querySelectorAll('.app-select-btn.open').forEach((other)=>{
+            other.classList.remove('open');
+            other.setAttribute('aria-expanded', 'false');
+        });
+        if (opening){
+            menu.classList.remove('hidden');
+            button.classList.add('open');
+            button.setAttribute('aria-expanded', 'true');
+        }
+    });
+    document.addEventListener('click', (event)=>{
+        if (!shell.contains(event.target)) close();
+    });
+    select.addEventListener('change', sync);
+    select._syncEnhancedSelect = sync;
+    rebuild();
+}
+
+enhanceSelect(document.getElementById('pf-tr-auth-mode'));
+
+function profileAuthModeValue(){
+    const mode = String($('#pf-tr-auth-mode')?.value || 'session_key').trim();
+    return mode === 'private_key' ? 'private_key' : 'session_key';
+}
+
+function updateProfileAuthModeUi(acct = myTradingAccount){
+    const privateMode = profileAuthModeValue() === 'private_key';
+    const pkWrap = $('#pf-tr-private-key-wrap');
+    const pkActions = $('.profile-private-key-actions');
+    const trBtn = $('#pf-tr-generate-trading');
+    const feeBtn = $('#pf-tr-generate-fee');
+    const hasKey = !!acct?.has_private_key;
+    if (pkWrap) pkWrap.classList.toggle('hidden', !privateMode || hasKey);
+    if (pkActions) pkActions.classList.toggle('hidden', !privateMode);
+    if (trBtn) trBtn.disabled = privateMode;
+    if (feeBtn) feeBtn.disabled = privateMode;
+    const ind = $('#pf-tr-private-key-indicator');
+    if (ind){
+        ind.textContent = hasKey ? 'Private key configured' : 'No private key configured';
+        ind.className = `key-indicator${hasKey ? ' ok' : ''}`;
+    }
+    const clearBtn = $('#pf-tr-clear-private-key');
+    if (clearBtn) clearBtn.disabled = !hasKey;
+}
+
+function updateProfileTradingToggleUi(){
+    const input = $('#pf-tr-enabled');
+    const label = $('#pf-tr-enabled-label');
+    if (!input || !label) return;
+    label.textContent = input.checked ? 'Enabled' : 'Paused';
+    label.classList.toggle('is-paused', !input.checked);
+}
+
+function setReadonlyAddressField(id, value){
+    const el = $(id);
+    if (!el) return;
+    const v = String(value || '').trim();
+    el.dataset.value = v;
+    el.textContent = v || 'Not set';
+    el.title = v || '';
+}
+
+async function persistProfileFunderIfPresent(extraBody = {}){
+    const funder = profileFunderValue();
+    const walletOwner = profileWalletOwnerValue();
+    const safeAddress = profileSafeValue();
+    if (!funder && !walletOwner && !safeAddress && !extraBody.wallet_owner && !extraBody.safe_address) return { ok: true };
+    const body = { ...extraBody };
+    if (funder) body.funder = funder;
+    if (walletOwner && body.wallet_owner == null) body.wallet_owner = walletOwner;
+    if (safeAddress && body.safe_address == null) body.safe_address = safeAddress;
+    const r = await updateMyTradingAccountRequest(body);
+    const js = await r.json().catch(()=>({}));
+    if (!r.ok) return { ok: false, detail: js.detail || 'Failed to save funder' };
+    return { ok: true };
+}
+
+function renderProfileTradingMeta(acct){
+    const meta = $('#pf-tr-meta');
+    const trInd = $('#pf-tr-trading-indicator');
+    const feeInd = $('#pf-tr-fee-indicator');
+    if (!meta) return;
+    if (!acct){
+        if (trInd) { trInd.textContent = 'Trading key not set'; trInd.className = 'key-indicator'; }
+        if (feeInd) { feeInd.textContent = 'Fee key not set'; feeInd.className = 'key-indicator'; }
+        meta.innerHTML = '<span>No trading account found yet. Save settings to create one.</span>';
+        return;
+    }
+    if (trInd) {
+        if (acct.auth_mode === 'private_key'){
+            trInd.textContent = acct.has_private_key ? 'Private key active' : 'Private key not set';
+            trInd.className = `key-indicator${acct.has_private_key ? ' ok' : ''}`;
+        } else {
+            trInd.textContent = !acct.has_trading_session_key ? 'Trading key not set' : acct.trading_key_expired ? 'Trading key expired' : 'Trading key set';
+            trInd.className = `key-indicator${!acct.has_trading_session_key ? '' : acct.trading_key_expired ? ' expired' : ' ok'}`;
+        }
+    }
+    if (feeInd) {
+        if (acct.auth_mode === 'private_key'){
+            feeInd.textContent = 'Fee uses private key';
+            feeInd.className = `key-indicator${acct.has_private_key ? ' ok' : ''}`;
+        } else {
+            feeInd.textContent = !acct.has_fee_session_key ? 'Fee key not set' : acct.fee_key_expired ? 'Fee key expired' : 'Fee key set';
+            feeInd.className = `key-indicator${!acct.has_fee_session_key ? '' : acct.fee_key_expired ? ' expired' : ' ok'}`;
+        }
+    }
+    meta.innerHTML = `
+        <span>Auth Mode: ${acct.auth_mode === 'private_key' ? 'Wallet Private Key' : 'Session Keys'}</span>
+        <span>Trading Expires: ${acct.auth_mode === 'private_key' ? 'n/a' : fmtMetaDate(acct.trading_session_expires_at)}</span>
+        <span>Fee Expires: ${acct.auth_mode === 'private_key' ? 'n/a' : fmtMetaDate(acct.fee_session_expires_at)}</span>
+    `;
+}
+
+async function loadMyTradingAccount(){
+    const r = await fetch('/api/user/trading-account', {headers: authHeaders()});
+    if (!r.ok){
+        renderProfileTradingMeta(null);
+        return;
+    }
+    const js = await r.json();
+    const acct = js.account || null;
+    myTradingAccount = acct;
+
+    // Profile toggle is user-level enable; admin-level enable is separate.
+    const userEnabled = !!(acct?.user_enabled ?? false);
+    const adminEnabled = !!(acct?.admin_enabled ?? false);
+    const requiresFeeKey = !!(acct?.requires_fee_key ?? true);
+    const pfEnabled = $('#pf-tr-enabled');
+    if (pfEnabled){
+        pfEnabled.checked = userEnabled;
+        pfEnabled.disabled = false;
+        pfEnabled.title = '';
+        updateProfileTradingToggleUi();
+    }
+    // Keep local copy so save validation can use server-side privilege rules.
+    if (myTradingAccount) myTradingAccount.requires_fee_key = requiresFeeKey;
+    if (myTradingAccount) myTradingAccount.admin_enabled = adminEnabled;
+    const authMode = $('#pf-tr-auth-mode');
+    if (authMode){
+        authMode.value = acct?.auth_mode === 'private_key' ? 'private_key' : 'session_key';
+        authMode._syncEnhancedSelect?.();
+    }
+    const pkInput = $('#pf-tr-private-key');
+    if (pkInput){
+        pkInput.value = '';
+        pkInput.placeholder = 'Enter private key';
+    }
+    setReadonlyAddressField('#pf-tr-funder', acct?.wallet_owner || '');
+    setReadonlyAddressField('#pf-tr-safe', acct?.safe_address || '');
+    renderProfileTradingMeta(acct);
+    updateProfileAuthModeUi(acct);
+}
+
+async function loadAdminTradingAccounts(){
+    const card = $('#trading-accounts-card');
+    if (!card) return;
+    if (!isAdmin){
+        card.classList.add('hidden');
+        return;
+    }
+
+    const r = await fetch('/api/trading/accounts', {headers: authHeaders()});
+    if (!r.ok){
+        card.classList.remove('hidden');
+        $('#trading-accounts-list').innerHTML = '<p class="inline-hint">Failed to load trading accounts.</p>';
+        return;
+    }
+
+    card.classList.remove('hidden');
+    const js = await r.json();
+    tradingAccounts = Array.isArray(js.accounts) ? js.accounts.slice() : [];
+    tradingAccounts.sort((a,b)=> (Number(b.priority)||0) - (Number(a.priority)||0));
+    renderTradingAccounts();
+}
+
+function renderTradingAccounts(){
+    const root = $('#trading-accounts-list');
+    if (!root) return;
+    root.innerHTML = '';
+    if (!tradingAccounts.length){
+        root.innerHTML = '<p class="inline-hint">No trading accounts configured.</p>';
+        return;
+    }
+
+    tradingAccounts.forEach((acct)=>{
+        const privileged = !!(acct.is_admin_or_founders || String(acct.name || '').toLowerCase() === 'founders');
+        const keyControlsHtml = privileged
+            ? `<div class="trading-key-grid trading-key-grid-single">
+                    <button class="btn outline ta-clear-trading" type="button">Revoke Trading Key</button>
+               </div>`
+            : `<div class="trading-key-grid">
+                    <button class="btn outline ta-clear-trading" type="button">Revoke Trading Key</button>
+                    <button class="btn outline ta-clear-fee" type="button">Revoke Fee Key</button>
+               </div>`;
+        const keyStatusHtml = privileged
+            ? `<div class="profile-key-status-row profile-key-status-row-single" style="margin-top:8px;">
+                    <span class="key-indicator${!acct.has_trading_session_key ? '' : acct.trading_key_expired ? ' expired' : ' ok'}">${!acct.has_trading_session_key ? 'Trading key not set' : acct.trading_key_expired ? 'Trading key expired' : 'Trading key set'}</span>
+               </div>`
+            : `<div class="profile-key-status-row" style="margin-top:8px;">
+                    <span class="key-indicator${!acct.has_trading_session_key ? '' : acct.trading_key_expired ? ' expired' : ' ok'}">${!acct.has_trading_session_key ? 'Trading key not set' : acct.trading_key_expired ? 'Trading key expired' : 'Trading key set'}</span>
+                    <span class="key-indicator${!acct.has_fee_session_key ? '' : acct.fee_key_expired ? ' expired' : ' ok'}">${!acct.has_fee_session_key ? 'Fee key not set' : acct.fee_key_expired ? 'Fee key expired' : 'Fee key set'}</span>
+               </div>`;
+        const keyMetaHtml = privileged
+            ? `<div class="trading-account-meta trading-account-meta-single">
+                    <span>Trading Expires: ${fmtMetaDate(acct.trading_session_expires_at)}</span>
+               </div>`
+            : `<div class="trading-account-meta">
+                    <span>Trading Expires: ${fmtMetaDate(acct.trading_session_expires_at)}</span>
+                    <span>Fee Expires: ${fmtMetaDate(acct.fee_session_expires_at)}</span>
+               </div>`;
+        const el = document.createElement('div');
+        el.className = 'trading-account-item';
+        el.dataset.name = acct.name;
+        el.dataset.privileged = privileged ? '1' : '0';
+        const sigType = Number.isInteger(Number(acct.signature_type)) ? Number(acct.signature_type) : 2;
+        const hasUserRecord = !!acct.has_user_record;
+        const userEnabled = !!acct.user_enabled;
+        const adminEnabled = !!acct.admin_enabled;
+        const effectiveEnabled = !!acct.enabled;
+        el.innerHTML = `
+            <div class="trading-account-head">
+                <div class="ta-account-identity">
+                    <span class="ta-avatar" aria-hidden="true">${String(acct.name || '?').trim().charAt(0).toUpperCase()}</span>
+                    <div><strong>${acct.name || ''}</strong><span class="ta-account-subtitle">Execution account</span></div>
+                </div>
+                <div class="ta-head-actions">
+                    <span class="ta-state-chip ${effectiveEnabled ? 'is-live' : 'is-paused'}">${effectiveEnabled ? 'Ready' : 'Paused'}</span>
+                    <button class="ta-drag-handle" type="button" aria-label="Drag to reorder"><span aria-hidden="true">⠿</span> Reorder</button>
+                </div>
+            </div>
+            <div class="ta-account-body">
+                <section class="ta-access-panel">
+                    <div class="ta-section-heading"><span>Trading access</span><small>User: ${userEnabled ? 'enabled' : 'paused'}</small></div>
+                    <div class="ta-enabled-switch-row">
+                        <label class="switch ta-switch admin-switch">
+                            <input type="checkbox" class="ta-admin-enabled" ${acct.admin_enabled ? 'checked' : ''} />
+                            <span class="slider"></span>
+                        </label>
+                        <div><strong>Admin permission</strong><small>${adminEnabled ? 'Orders are permitted' : 'Orders are blocked'}</small></div>
+                    </div>
+                </section>
+                <section class="ta-wallet-panel">
+                    <div class="ta-section-heading"><span>Funder</span><small>Connected execution wallet</small></div>
+                    <div class="ta-wallet-row">
+                        <div class="ta-funder ta-funder-readonly" data-value="${acct.funder || ''}" title="${acct.funder || ''}">${acct.funder || 'Not set'}</div>
+                        <button class="btn outline ta-connect-wallet" type="button">Connect Wallet</button>
+                    </div>
+                </section>
+                <section class="ta-policy-panel">
+                    <label class="ta-signature-field"><span class="ta-field-label">Signature Type</span>
+                        <select class="input ta-signature-type">
+                            <option value="0" ${sigType === 0 ? 'selected' : ''}>EOA Wallet (0)</option>
+                            <option value="1" ${sigType === 1 ? 'selected' : ''}>Legacy Mode (1)</option>
+                            <option value="2" ${sigType === 2 ? 'selected' : ''}>Browser Safe (2)</option>
+                        </select>
+                    </label>
+                    <label class="ta-admin-role">
+                        <input type="checkbox" class="ta-is-admin" ${acct.is_admin ? 'checked' : ''} ${hasUserRecord ? '' : 'disabled'} />
+                        <span class="ta-role-check" aria-hidden="true"></span>
+                        <span class="ta-role-copy"><strong>Admin Account</strong><small>${hasUserRecord ? 'Management access' : 'No linked user record'}</small></span>
+                    </label>
+                </section>
+            </div>
+            <div class="ta-key-panel">
+                <div class="ta-key-summary">${keyStatusHtml}${keyMetaHtml}</div>
+                ${keyControlsHtml}
+            </div>
+            <div class="ta-account-actions">
+                <button class="btn emergency ta-delete-account" type="button">Delete Account</button>
+                <button class="btn primary ta-save short" type="button">Save Account</button>
+            </div>
+        `;
+
+        wireTradingAccountDnD(el);
+        wireTradingAccountActions(el, acct);
+        root.appendChild(el);
+        enhanceSelect(el.querySelector('.ta-signature-type'));
+    });
+}
+
+async function saveTradingAccountOrder(root){
+    const ordered_names = Array.from(root.querySelectorAll('.trading-account-item')).map(el => el.dataset.name).filter(Boolean);
+    const r = await fetch('/api/trading/accounts/reorder', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json', ...authHeaders()},
+        body: JSON.stringify({ordered_names}),
+    });
+    const js = await r.json().catch(()=>({}));
+    if (!r.ok){ showToast(js.detail || 'Failed to save account order', 'error', 3200); return false; }
+    return true;
+}
+
+function wireTradingAccountDnD(el){
+    const root = $('#trading-accounts-list');
+    const handle = el.querySelector('.ta-drag-handle');
+    if (!root || !handle) return;
+
+    el.setAttribute('draggable', 'false');
+    let dragArmed = false;
+    handle.addEventListener('mousedown', ()=>{
+        dragArmed = true;
+        el.setAttribute('draggable', 'true');
+    });
+    handle.addEventListener('mouseup', ()=>{
+        if (!adminDraggingAccountEl){
+            dragArmed = false;
+            el.setAttribute('draggable', 'false');
+        }
+    });
+
+    el.addEventListener('dragstart', (e)=>{
+        if (!dragArmed){
+            e.preventDefault();
+            return;
+        }
+        adminDraggingAccountEl = el;
+        adminLastDragClientY = Number.isFinite(e.clientY) ? e.clientY : null;
+        dragArmed = false;
+        el.classList.add('dragging-live');
+        document.body.classList.add('no-select');
+        if (e.dataTransfer){
+            e.dataTransfer.effectAllowed = 'move';
+            e.dataTransfer.setData('text/plain', el.dataset.name || '');
+        }
+    });
+
+    el.addEventListener('dragend', async ()=>{
+        dragArmed = false;
+        el.setAttribute('draggable', 'false');
+        if (!adminDraggingAccountEl) return;
+        adminDraggingAccountEl = null;
+        adminLastDragClientY = null;
+        el.classList.remove('dragging-live');
+        document.body.classList.remove('no-select');
+        const names = Array.from(root.querySelectorAll('.trading-account-item')).map(n => n.dataset.name);
+        tradingAccounts.sort((a, b) => names.indexOf(a.name) - names.indexOf(b.name));
+        const ok = await saveTradingAccountOrder(root);
+        if (ok) showToast('Account order saved', 'success', 1800);
+    });
+
+    if (root.dataset.dndBound === '1') return;
+    root.dataset.dndBound = '1';
+
+    root.addEventListener('dragover', (e)=>{
+        const draggingEl = adminDraggingAccountEl;
+        if (!draggingEl) return;
+        e.preventDefault();
+        const edge = 120;
+        let dy = 0;
+        if (e.clientY < edge) dy = -14;
+        else if (e.clientY > (window.innerHeight - edge)) dy = 14;
+        if (dy) window.scrollBy(0, dy);
+        const target = e.target.closest('.trading-account-item');
+        if (!target || target === draggingEl) return;
+        const rect = target.getBoundingClientRect();
+        const y = Number(e.clientY || 0);
+        const prevY = adminLastDragClientY;
+        const movingUp = Number.isFinite(prevY) && y < prevY;
+        const movingDown = Number.isFinite(prevY) && y > prevY;
+        adminLastDragClientY = y;
+        let before;
+        if (movingUp) before = (y <= (rect.bottom - 2));
+        else if (movingDown) before = (y < (rect.top + 2));
+        else before = (y < rect.top + (rect.height / 2));
+        if (before) root.insertBefore(draggingEl, target);
+        else root.insertBefore(draggingEl, target.nextSibling);
+    });
+}
+
+function wireTradingAccountActions(el, acct){
+    el.querySelector('.ta-connect-wallet')?.addEventListener('click', async ()=>{
+        try{
+            const wallet = await connectWalletAddress();
+            const field = el.querySelector('.ta-funder-readonly');
+            if (field){
+                field.dataset.value = wallet.funder || '';
+                field.textContent = wallet.funder || 'Not set';
+                field.title = wallet.funder || '';
+            }
+            // Clear session keys — they belong to the previous wallet
+            await Promise.allSettled([
+                fetch(`/api/trading/accounts/${encodeURIComponent(acct.name)}/session-keys/trading`, { method: 'DELETE', headers: authHeaders() }),
+                fetch(`/api/trading/accounts/${encodeURIComponent(acct.name)}/session-keys/fee`,     { method: 'DELETE', headers: authHeaders() }),
+            ]);
+            await loadAdminTradingAccounts();
+            showToast(`Wallet connected. Session keys cleared — please regenerate them.`, 'warning', 4000);
+        } catch (err) {
+            showToast(err.message || 'Wallet connection failed', 'error', 3200);
+        }
+    });
+
+    el.querySelector('.ta-save')?.addEventListener('click', async ()=>{
+        const sigRaw = el.querySelector('.ta-signature-type')?.value;
+        const sigVal = Number(sigRaw);
+        const funderVal = (el.querySelector('.ta-funder-readonly')?.dataset?.value || '').trim();
+        const adminRoleEl = el.querySelector('.ta-is-admin');
+        const body = {
+            enabled: !!el.querySelector('.ta-admin-enabled')?.checked,
+            signature_type: Number.isInteger(sigVal) ? sigVal : 2,
+        };
+        if (adminRoleEl && !adminRoleEl.disabled){
+            body.is_admin = !!adminRoleEl.checked;
+        }
+        if (funderVal) body.funder = funderVal;
+        const r = await fetch(`/api/trading/accounts/${encodeURIComponent(acct.name)}`, {
+            method: 'PATCH',
+            headers: {'Content-Type':'application/json', ...authHeaders()},
+            body: JSON.stringify(body),
+        });
+        const js = await r.json().catch(()=>({}));
+        if (!r.ok){ showToast(js.detail || 'Failed to save account', 'error', 3200); return; }
+        showToast(`Saved ${acct.name}`, 'success');
+        await loadAdminTradingAccounts();
+    });
+
+    el.querySelector('.ta-clear-trading')?.addEventListener('click', async ()=>{
+        const r = await fetch(`/api/trading/accounts/${encodeURIComponent(acct.name)}/session-keys/trading`, {
+            method: 'DELETE',
+            headers: authHeaders(),
+        });
+        const js = await r.json().catch(()=>({}));
+        if (!r.ok){ showToast(js.detail || 'Failed to clear trading key', 'error', 3200); return; }
+        showToast(`Trading key cleared: ${acct.name}`, 'success');
+        await loadAdminTradingAccounts();
+    });
+
+    el.querySelector('.ta-clear-fee')?.addEventListener('click', async ()=>{
+        const r = await fetch(`/api/trading/accounts/${encodeURIComponent(acct.name)}/session-keys/fee`, {
+            method: 'DELETE',
+            headers: authHeaders(),
+        });
+        const js = await r.json().catch(()=>({}));
+        if (!r.ok){ showToast(js.detail || 'Failed to clear fee key', 'error', 3200); return; }
+        showToast(`Fee key cleared: ${acct.name}`, 'success');
+        await loadAdminTradingAccounts();
+    });
+
+    el.querySelector('.ta-delete-account')?.addEventListener('click', ()=>{
+        const dlg = $('#dlg-admin-delete');
+        if (!dlg) return;
+        adminDeleteTargetName = acct.name || '';
+        $('#admin-delete-target').textContent = `Account: ${adminDeleteTargetName}`;
+        $('#admin-delete-hint').textContent = '';
+        dlg.showModal();
+    });
+}
+
 // Username edit via dialog
 const dlgU = $('#dlg-uname');
+let unameCheckTimer = null;
+let unameCheckSeq = 0;
+
+function setUnameHint(msg, color=''){
+    const hint = $('#uname-hint');
+    if (!hint) return;
+    hint.textContent = msg || '';
+    hint.style.color = color || '';
+}
+
+function setUnameSubmitDisabled(disabled){
+    const btn = $('#uname-submit');
+    if (!btn) return;
+    btn.disabled = !!disabled;
+}
+
+async function validateUsernameLive(value){
+    const candidate = String(value || '').trim();
+    const current = String($('#pf-username-view')?.textContent || '').trim();
+    if (!candidate){
+        setUnameHint('Username must be at least 8 characters', '#ef4444');
+        setUnameSubmitDisabled(true);
+        return false;
+    }
+    if (candidate.length < 8){
+        setUnameHint('Username must be at least 8 characters', '#ef4444');
+        setUnameSubmitDisabled(true);
+        return false;
+    }
+    if (!/^[A-Za-z0-9_]+$/.test(candidate)){
+        setUnameHint('Username can only use letters, numbers, and underscores', '#ef4444');
+        setUnameSubmitDisabled(true);
+        return false;
+    }
+    if (candidate.toLowerCase() === current.toLowerCase()){
+        setUnameHint('', '');
+        setUnameSubmitDisabled(false);
+        return true;
+    }
+
+    const seq = ++unameCheckSeq;
+    setUnameHint('', '');
+    setUnameSubmitDisabled(true);
+    try{
+        let r = await fetch(`/api/username-availability?username=${encodeURIComponent(candidate)}`, {
+            headers: authHeaders(),
+        });
+        let js = await r.json().catch(()=>({}));
+        // Compatibility fallback if server is still on previous route.
+        if (r.status === 404){
+            r = await fetch(`/api/user/username-availability?username=${encodeURIComponent(candidate)}`, {
+                headers: authHeaders(),
+            });
+            js = await r.json().catch(()=>({}));
+        }
+        if (seq !== unameCheckSeq) return false;
+        if (!r.ok){
+            const detail = String(js.detail || '');
+            const normalized = (detail === 'Not Found' || !detail)
+                ? 'Username check service unavailable. Restart server and try again.'
+                : detail;
+            setUnameHint(normalized, '#ef4444');
+            setUnameSubmitDisabled(true);
+            return false;
+        }
+        if (js.available){
+            if (js.is_current){
+                setUnameHint('', '');
+            } else {
+                setUnameHint('Username available', '#22c55e');
+            }
+            setUnameSubmitDisabled(false);
+            return true;
+        }
+        setUnameHint(String(js.reason || 'Username unavailable'), '#ef4444');
+        setUnameSubmitDisabled(true);
+        return false;
+    } catch (_err){
+        if (seq !== unameCheckSeq) return false;
+        setUnameHint('Username check service unavailable. Try again.', '#ef4444');
+        setUnameSubmitDisabled(true);
+        return false;
+    }
+}
+
 $('#pf-edit-username')?.addEventListener('click', ()=>{
-    $('#uname-hint').textContent='';
-    $('#dlg-uname-input').value = $('#pf-username-view').textContent || '';
+    const input = $('#dlg-uname-input');
+    input.value = $('#pf-username-view').textContent || '';
+    setUnameHint('', '');
+    setUnameSubmitDisabled(false);
+    if (unameCheckTimer) clearTimeout(unameCheckTimer);
+    unameCheckTimer = setTimeout(()=>{ validateUsernameLive(input.value); }, 0);
     dlgU.showModal();
 });
 $('#uname-cancel')?.addEventListener('click', ()=>{ try{ dlgU.close(); }catch(_){} });
+$('#dlg-uname-input')?.addEventListener('input', (e)=>{
+    if (unameCheckTimer) clearTimeout(unameCheckTimer);
+    setUnameHint('', '');
+    setUnameSubmitDisabled(true);
+    unameCheckTimer = setTimeout(()=>{
+        validateUsernameLive(e.target.value);
+    }, 250);
+});
 $('#uname-submit')?.addEventListener('click', async (e)=>{
     e.preventDefault();
     const new_username = ($('#dlg-uname-input').value||'').trim();
-    if (!new_username) { $('#uname-hint').textContent = 'Enter a username.'; return; }
+    const okToSubmit = await validateUsernameLive(new_username);
+    if (!okToSubmit){
+        return;
+    }
     const r = await fetch('/api/user/profile', {method:'POST', headers:{'Content-Type':'application/json', ...authHeaders()}, body: JSON.stringify({new_username})});
     const js = await r.json().catch(()=>({}));
     if (r.ok){
         $('#user-menu-name').textContent = new_username;
         $('#pf-username-view').textContent = new_username;
+        setUnameHint('', '');
         setTimeout(()=>{ try{ dlgU.close(); }catch(_){} }, 200);
     } else {
-        $('#uname-hint').textContent = js.detail || 'Failed to update username';
+        const detail = String(js.detail || 'Failed to update username');
+        setUnameHint(detail, '#ef4444');
+        setUnameSubmitDisabled(true);
     }
 });
 // Handle profile form submit (Save Settings)
 $('#pf-settings-form')?.addEventListener('submit', async (ev)=>{
     ev.preventDefault();
-    const paused = !!$('#pf-paused').checked;
     const abbr = ($('#pf-timezone').value || currentAbbrForIana(userTimezone));
     const timezone = US_TZ_ABBR_TO_IANA[abbr] || userTimezone;
-    const pkInput = $('#pf-privkey');
-    const pkVal = (pkInput.value||'').trim();
-    const clear_private_key = (pkInput.dataset.cleared === '1') ? true : undefined;
-    const body = {paused, timezone};
-    if (pkVal) body.private_key = pkVal;
-    if (clear_private_key) body.clear_private_key = true;
+    const body = {timezone};
     const resp = await fetch('/api/user/profile', {method:'POST', headers:{'Content-Type':'application/json', ...authHeaders()}, body: JSON.stringify(body)});
-    userTimezone = timezone; // internal uses IANA
-    if (resp.ok){
-        showToast('Settings saved', 'success');
-    } else {
+    userTimezone = timezone;
+    if (resp.ok){ showToast('Settings saved', 'success'); }
+    else {
         const err = await resp.json().catch(()=>({}));
         showToast(err.detail || 'Failed to save settings', 'error', 3200);
     }
 });
-$('#pf-clear-privkey')?.addEventListener('click', ()=>{ const i=$('#pf-privkey'); i.value=''; i.dataset.cleared='1'; i.placeholder='Will clear on Save'; });
-// Toggle eye buttons (profile privkey)
-$('#pf-toggle-privkey')?.addEventListener('click', ()=>{
-    const i = $('#pf-privkey'); if (!i) return;
-    const isPw = i.getAttribute('type') === 'password';
-    i.setAttribute('type', isPw ? 'text' : 'password');
+
+$('#pf-tr-save-settings')?.addEventListener('click', async ()=>{
+    const authMode = profileAuthModeValue();
+    const privateKeyInput = ($('#pf-tr-private-key')?.value || '').trim();
+    const body = {
+        // Profile toggle controls user-level enable only.
+        enabled: !!$('#pf-tr-enabled')?.checked,
+        auth_mode: authMode,
+    };
+    const funder = profileFunderValue();
+    const walletOwner = profileWalletOwnerValue();
+    const safeAddress = profileSafeValue();
+    if (authMode === 'private_key' && privateKeyInput){
+        body.private_key = privateKeyInput;
+    }
+    if (authMode === 'private_key'){
+        if (walletOwner) body.wallet_owner = walletOwner;
+    } else if (funder){
+        body.funder = funder;
+    } else if (!walletOwner && !safeAddress) {
+        body.clear_funder = true;
+    }
+    if (walletOwner) body.wallet_owner = walletOwner;
+    if (authMode !== 'private_key' && safeAddress) body.safe_address = safeAddress;
+    if (body.enabled) {
+        if (!myTradingAccount?.admin_enabled){
+            showToast('This account must be enabled first on the Admin page', 'error', 3200);
+            return;
+        }
+        if (authMode === 'private_key'){
+            if (!privateKeyInput && !myTradingAccount?.has_private_key){
+                showToast('Wallet private key is required before enabling trading', 'error', 3200);
+                return;
+            }
+        } else {
+        const hasTrading = !!(myTradingAccount?.has_trading_session_key);
+        const needsFee = !!(myTradingAccount?.requires_fee_key ?? true);
+        const hasFee = !!(myTradingAccount?.has_fee_session_key);
+        if (needsFee && !hasTrading && !hasFee){
+            showToast('Trading and fee session keys are required before enabling trading', 'error', 3200);
+            return;
+        }
+        if (!hasTrading){
+            showToast('Trading session key is required before enabling trading', 'error', 3200);
+            return;
+        }
+        if (needsFee && !hasFee){
+            showToast('Fee session key is required before enabling trading', 'error', 3200);
+            return;
+        }
+        }
+    }
+    const r = await updateMyTradingAccountRequest(body);
+    const js = await r.json().catch(()=>({}));
+    if (!r.ok){ showToast(js.detail || 'Failed to save trading settings', 'error', 3200); return; }
+    showToast('Trading settings saved', 'success');
+    await loadMyTradingAccount();
 });
+
+$('#pf-tr-auth-mode')?.addEventListener('change', ()=>{
+    updateProfileAuthModeUi(myTradingAccount);
+});
+
+$('#pf-tr-enabled')?.addEventListener('change', updateProfileTradingToggleUi);
+
+$('#pf-tr-connect-wallet')?.addEventListener('click', async ()=>{
+    try{
+        const privateMode = profileAuthModeValue() === 'private_key';
+        const wallet = await connectWalletAddress({ requireSafe: !privateMode, forcePrompt: true, allowSavedSafeFallback: !privateMode });
+        setReadonlyAddressField('#pf-tr-funder', wallet.eoa || '');
+        setReadonlyAddressField('#pf-tr-safe', wallet.safe || '');
+        const saved = await persistProfileFunderIfPresent({
+            wallet_owner: wallet.eoa,
+            safe_address: wallet.safe || wallet.funder,
+            auth_mode: privateMode ? 'private_key' : 'session_key',
+        });
+        if (!saved.ok){
+            showToast(saved.detail || 'Wallet connected but failed to save funder', 'error', 3200);
+            return;
+        }
+        // Clear session keys — they belong to the previous wallet
+        if (!privateMode){
+            await Promise.allSettled([
+            fetch('/api/user/trading-account/session-keys/trading', { method: 'DELETE', headers: authHeaders() }),
+            fetch('/api/user/trading-account/session-keys/fee',     { method: 'DELETE', headers: authHeaders() }),
+            ]);
+        }
+        await loadMyTradingAccount();
+        if (privateMode){
+            showToast('Wallet connected. Add the matching private key, then save.', 'success', 4000);
+            return;
+        }
+        showToast(`Wallet connected. Session keys cleared — please regenerate them.`, 'warning', 4000);
+    } catch (err) {
+        showToast(err.message || 'Wallet connection failed', 'error', 3200);
+    }
+});
+
+$('#pf-tr-clear-funder')?.addEventListener('click', async ()=>{
+    setReadonlyAddressField('#pf-tr-funder', '');
+    setReadonlyAddressField('#pf-tr-safe', '');
+    showToast('Addresses cleared locally. Click Save Trading Settings to apply.', 'warning', 2600);
+});
+
+$('#pf-tr-clear-private-key')?.addEventListener('click', async ()=>{
+    const r = await updateMyTradingAccountRequest({ clear_private_key: true });
+    const js = await r.json().catch(()=>({}));
+    if (!r.ok){ showToast(js.detail || 'Failed to clear private key', 'error', 3200); return; }
+    const input = $('#pf-tr-private-key');
+    if (input) input.value = '';
+    showToast('Private key cleared', 'success');
+    await loadMyTradingAccount();
+});
+
+$('#pf-tr-generate-trading')?.addEventListener('click', async ()=>{
+    const saved = await persistProfileFunderIfPresent();
+    if (!saved.ok){ showToast(saved.detail || 'Failed to save funder', 'error', 3200); return; }
+    const r = await fetch('/api/user/trading-account/session-keys/trading/generate', {
+        method: 'POST',
+        headers: authHeaders(),
+    });
+    const js = await r.json().catch(()=>({}));
+    if (!r.ok){ showToast(js.detail || 'Failed to set trading key', 'error', 3200); return; }
+    showToast('Trading session key updated', 'success');
+    await loadMyTradingAccount();
+});
+
+$('#pf-tr-generate-fee')?.addEventListener('click', async ()=>{
+    const saved = await persistProfileFunderIfPresent();
+    if (!saved.ok){ showToast(saved.detail || 'Failed to save funder', 'error', 3200); return; }
+    const r = await fetch('/api/user/trading-account/session-keys/fee/generate', {
+        method: 'POST',
+        headers: authHeaders(),
+    });
+    const js = await r.json().catch(()=>({}));
+    if (!r.ok){ showToast(js.detail || 'Failed to set fee key', 'error', 3200); return; }
+    showToast('Fee session key updated', 'success');
+    await loadMyTradingAccount();
+});
+
+$('#pf-tr-clear-trading')?.addEventListener('click', async ()=>{
+    const r = await fetch('/api/user/trading-account/session-keys/trading', {
+        method: 'DELETE',
+        headers: authHeaders(),
+    });
+    const js = await r.json().catch(()=>({}));
+    if (!r.ok){ showToast(js.detail || 'Failed to clear trading key', 'error', 3200); return; }
+    showToast('Trading session key cleared', 'success');
+    await loadMyTradingAccount();
+});
+
+$('#pf-tr-clear-fee')?.addEventListener('click', async ()=>{
+    const r = await fetch('/api/user/trading-account/session-keys/fee', {
+        method: 'DELETE',
+        headers: authHeaders(),
+    });
+    const js = await r.json().catch(()=>({}));
+    if (!r.ok){ showToast(js.detail || 'Failed to clear fee key', 'error', 3200); return; }
+    showToast('Fee session key cleared', 'success');
+    await loadMyTradingAccount();
+});
+
 // Change password dialog wiring
 const dlgPass = $('#dlg-pass');
 $('#pf-open-pass')?.addEventListener('click', ()=>{ $('#pass-hint').textContent=''; $('#dlg-old').value=''; $('#dlg-new').value=''; $('#dlg-pw-req').style.display='none'; dlgPass.showModal(); });
 $('#pass-cancel')?.addEventListener('click', ()=>{ try{ dlgPass.close(); }catch(_){} });
 const pwDlgInput = $('#dlg-new');
 pwDlgInput?.addEventListener('input', ()=>{
-    const v = pwDlgInput.value||''; const hasLen=v.length>=10, hasLet=/[A-Za-z]/.test(v), hasDig=/\d/.test(v);
+    const v = pwDlgInput.value||''; const hasLen=v.length>=10, hasMax=v.length<=20, hasLet=/[A-Za-z]/.test(v), hasDig=/\d/.test(v);
     $('#dlg-pw-req').style.display = v.length? 'block':'none';
-    const set=(s,o)=>{const el=$(`#dlg-pw-req li[data-rule="${s}"]`); if (el) el.classList.toggle('ok',!!o)}; set('len',hasLen); set('letters',hasLet); set('digits',hasDig);
+    const set=(s,o)=>{const el=$(`#dlg-pw-req li[data-rule="${s}"]`); if (el) el.classList.toggle('ok',!!o)}; set('len',hasLen); set('max',hasMax); set('letters',hasLet); set('digits',hasDig);
 });
 $('#pass-submit')?.addEventListener('click', async (e)=>{
     e.preventDefault();
     const old_password = ($('#dlg-old').value||''); const new_password = ($('#dlg-new').value||'');
     if (!old_password || !new_password) { $('#pass-hint').textContent='Please enter both current and new password.'; return; }
-    const strong=/^(?=.*[A-Za-z])(?=.*\d).{10,}$/.test(new_password); if(!strong){ $('#pass-hint').textContent='New password does not meet requirements.'; return; }
+    const strong=/^(?=.*[A-Za-z])(?=.*\d).{10,20}$/.test(new_password); if(!strong){ $('#pass-hint').textContent='New password does not meet requirements (10-20 chars, letters and numbers).'; return; }
     const r = await fetch('/api/user/profile', {method:'POST', headers:{'Content-Type':'application/json', ...authHeaders()}, body: JSON.stringify({old_password,new_password})});
     const js = await r.json().catch(()=>({}));
     if (r.ok){ $('#pass-hint').textContent='Password changed.'; setTimeout(()=>{ try{ dlgPass.close(); }catch(_){} }, 300); }
@@ -1181,9 +2985,17 @@ $('#pass-submit')?.addEventListener('click', async (e)=>{
 function wireToggle(btnSel, inputSel){
     const b = document.querySelector(btnSel); const i = document.querySelector(inputSel);
     if (!b || !i) return;
+    const sync = ()=>{
+        const isPw = i.getAttribute('type') === 'password';
+        b.classList.toggle('is-revealed', !isPw);
+        b.title = isPw ? 'Show password' : 'Hide password';
+        b.setAttribute('aria-label', b.title);
+    };
+    sync();
     b.addEventListener('click', ()=>{
         const isPw = i.getAttribute('type') === 'password';
         i.setAttribute('type', isPw ? 'text' : 'password');
+        sync();
     });
 }
 wireToggle('#dlg-old-toggle', '#dlg-old');
@@ -1255,6 +3067,47 @@ dlgDeleteAccount.addEventListener('mousedown', (e)=>{ deleteBackdropDown = (e.ta
 dlgDeleteAccount.addEventListener('click', (e)=>{ if (e.target === dlgDeleteAccount && deleteBackdropDown) { try{ dlgDeleteAccount.close(); }catch(_){} } deleteBackdropDown=false; });
 dlgDeleteAccount.addEventListener('cancel', (e)=>{ e.preventDefault(); try{ dlgDeleteAccount.close(); }catch(_){} });
 
+// Admin delete-trading-account dialog
+$('#admin-delete-cancel')?.addEventListener('click', ()=>{
+    adminDeleteTargetName = '';
+    try{ $('#dlg-admin-delete').close(); } catch(_){}
+});
+
+$('#admin-delete-confirm')?.addEventListener('click', async (e)=>{
+    e.preventDefault();
+    const target = String(adminDeleteTargetName || '').trim();
+    if (!target){
+        $('#admin-delete-hint').textContent = 'No account selected.';
+        return;
+    }
+    try{
+        const dlg = $('#dlg-admin-delete');
+        if (dlg) dlg.close();
+        const r = await fetch(`/api/trading/accounts/${encodeURIComponent(target)}`, {
+            method: 'DELETE',
+            headers: authHeaders(),
+        });
+        const js = await r.json().catch(()=>({}));
+        if (!r.ok){
+            showToast(js.detail || 'Failed to delete account', 'error', 3200);
+            return;
+        }
+        showToast(`Deleted ${target}`, 'success');
+        adminDeleteTargetName = '';
+        await loadAdminTradingAccounts();
+    } catch (err){
+        showToast(err.message || 'Failed to delete account', 'error', 3200);
+    }
+});
+
+const dlgAdminDelete = $('#dlg-admin-delete');
+if (dlgAdminDelete){
+    let adminDeleteBackdropDown = false;
+    dlgAdminDelete.addEventListener('mousedown', (e)=>{ adminDeleteBackdropDown = (e.target === dlgAdminDelete); });
+    dlgAdminDelete.addEventListener('click', (e)=>{ if (e.target === dlgAdminDelete && adminDeleteBackdropDown) { try{ dlgAdminDelete.close(); }catch(_){} } adminDeleteBackdropDown=false; });
+    dlgAdminDelete.addEventListener('cancel', (e)=>{ e.preventDefault(); try{ dlgAdminDelete.close(); }catch(_){} });
+}
+
 // Load real statistics for about page
 async function loadStats() {
     try {
@@ -1290,4 +3143,3 @@ loadStats();
 
 // Start auto-refresh
 startStatsAutoRefresh();
-
