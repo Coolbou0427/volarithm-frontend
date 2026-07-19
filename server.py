@@ -17,7 +17,7 @@ import hashlib
 import re
 from pathlib import Path
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 import asyncio
 import threading
 import time
@@ -63,6 +63,27 @@ STATS_CACHE = {
     'last_update': None,
     'update_interval': 30  # Update every 30 seconds instead of 5 minutes
 }
+
+ABOUT_STATS_RESET_DATE = date(2026, 7, 18)
+ABOUT_STATS_EXCLUDED_ACCOUNTS = {"founder", "founders", "test", "performance_audit"}
+
+
+def _about_stats_start_date(users_cfg: dict):
+    raw = users_cfg.get('_bot_config', {}).get('about_start_date')
+    try:
+        return datetime.strptime(str(raw), '%Y-%m-%d').date() if raw else ABOUT_STATS_RESET_DATE
+    except Exception:
+        return ABOUT_STATS_RESET_DATE
+
+
+def _about_public_user_count(users_cfg: dict) -> int:
+    accounts = users_cfg.get('_trading_config', {}).get('accounts', [])
+    names = {
+        str(account.get('name') or '').strip().casefold()
+        for account in accounts
+        if isinstance(account, dict)
+    }
+    return len({name for name in names if name and name not in ABOUT_STATS_EXCLUDED_ACCOUNTS})
 
 YAHOO_CRUMB_CACHE: Dict[str, Any] = {"crumb": None, "expires_at": 0.0}
 
@@ -239,15 +260,10 @@ def calculate_fast_stats():
     """Quick stats calculation using only local data (no API calls)"""
     try:
         users_cfg = _load_users()
-        start_str = users_cfg.get('_bot_config', {}).get('start_date', '2025-08-28')
-        try:
-            start_date = datetime.strptime(start_str, '%Y-%m-%d').date()
-        except Exception:
-            start_date = datetime.utcnow().date()
-        days_running = (datetime.utcnow().date() - start_date).days + 1
+        about_start_date = _about_stats_start_date(users_cfg)
+        days_running = (datetime.utcnow().date() - about_start_date).days + 1
         
-        # Just count users quickly
-        user_count = len([k for k in users_cfg.keys() if not k.startswith('_')])
+        user_count = _about_public_user_count(users_cfg)
         
         # Get base profit from balance history
         base_val = 10.36  # Default
@@ -294,7 +310,6 @@ def calculate_fresh_stats():
     # Load base profit from balance_history.json instead of hardcoded value
     def _get_base_profit():
         try:
-            import json
             from pathlib import Path
             balance_history_path = Path(__file__).parent.parent / "state" / "balance_history.json"
             if balance_history_path.exists():
@@ -372,16 +387,19 @@ def calculate_fresh_stats():
     try:
         # Days running and start window from bot config
         users_cfg = _load_users()
-        start_str = users_cfg.get('_bot_config', {}).get('start_date', '2025-08-28')
-        try:
-            start_date = datetime.strptime(start_str, '%Y-%m-%d').date()
-        except Exception:
-            start_date = datetime.utcnow().date()
-        days_running = (datetime.utcnow().date() - start_date).days + 1
+        about_start_date = _about_stats_start_date(users_cfg)
+        days_running = (datetime.utcnow().date() - about_start_date).days + 1
 
-        # Ledger-based aggregation since start_date
+        # Resetting the public counter must not discard older realized PnL.
+        ledger_start_raw = users_cfg.get('_bot_config', {}).get('start_date', '2025-08-28')
+        try:
+            ledger_start_date = datetime.strptime(ledger_start_raw, '%Y-%m-%d').date()
+        except Exception:
+            ledger_start_date = about_start_date
+
+        # Ledger PnL still covers the strategy's original accounting window.
         accounts_cfg, users = _collect_accounts()
-        user_count = len([k for k in users.keys() if not k.startswith('_')])
+        user_count = _about_public_user_count(users)
         agg_realized = 0.0
         details = []
         any_ledger = False
@@ -410,7 +428,7 @@ def calculate_fresh_stats():
                         d = datetime.fromisoformat(ts).date() if ts else None
                     except Exception:
                         d = None
-                    if d and d < start_date:
+                    if d and d < ledger_start_date:
                         continue
                     ev = str(r.get("event") or "").upper()
                     px = float(r.get("price") or 0.0)
@@ -530,7 +548,7 @@ def calculate_fresh_stats():
 
         # Display strategy:
         # - realized_profit: our ledger-since-start realized (agg_realized)  
-        # - total_profit: prefer profile_adjustment if set (matches actual Polymarket profile), otherwise use API data
+        # - total_profit: live API/ledger PnL plus any configured calibration adjustment
         # - total_profit_with_base: total_profit + base carryover
         
         # Manual adjustment for profile matching (this should match what user sees on Polymarket profile)
@@ -538,16 +556,12 @@ def calculate_fresh_stats():
         if profile_adjustment == 0.0:
             profile_adjustment = float(os.environ.get("PROFILE_PNL_ADJUSTMENT", "0.0"))
         
-        # If we have a profile adjustment, use it (this matches the actual Polymarket profile)
-        # Otherwise fall back to API data
-        if abs(profile_adjustment) > 1e-9:
-            final_total = profile_adjustment
-        else:
-            final_total = (
-                data_api_cash if abs(data_api_cash) > 1e-9 else (
-                    clob_realized_sum if abs(clob_realized_sum) > 1e-9 else agg_realized
-                )
+        live_total = (
+            data_api_cash if abs(data_api_cash) > 1e-9 else (
+                clob_realized_sum if abs(clob_realized_sum) > 1e-9 else agg_realized
             )
+        )
+        final_total = live_total + profile_adjustment
         
         with_base = final_total + ORIGINAL_BASE
         return {
@@ -752,7 +766,17 @@ def _safe_client_gateway_base() -> str:
 
 
 def _polygon_rpc_url() -> str:
-    return os.environ.get("POLYGON_RPC_URL", "https://polygon-rpc.com").strip() or "https://polygon-rpc.com"
+    configured = os.environ.get("POLYGON_RPC_URL", "").strip()
+    if configured:
+        return configured
+    try:
+        db = _load_users()
+        from_file = str(db.get("_trading_config", {}).get("chain", {}).get("polygon_rpc_url") or "").strip()
+        if from_file:
+            return from_file
+    except Exception:
+        pass
+    return "https://polygon-rpc.com"
 
 
 def _yahoo_user_agent() -> str:
@@ -918,6 +942,7 @@ def _polygon_usdc_balance(safe_addr: Optional[str]) -> tuple[Optional[float], Di
         return None, {}
     # Native USDC and legacy USDC.e on Polygon
     token_map = {
+        "pUSD": "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB",
         "USDC": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359",
         "USDC.e": "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
     }
@@ -3173,9 +3198,11 @@ def _position_cost_since(ledger_path: Path, start_dt: datetime):
 
 
 @app.get("/api/user/summary")
-def user_summary(user: User = Depends(get_current_user)):
-    # Single-account assumption: username folder
-    name = user.username
+def user_summary(account: Optional[str] = None, user: User = Depends(get_current_user)):
+    # Regular users can only query themselves; admins may inspect each account.
+    name = str(account or user.username).strip()
+    if not user.is_admin:
+        name = user.username
     ledger = STATE / name / "trades.jsonl"
     start = today_noon_et(now_et())
     cost = _position_cost_since(ledger, start)
@@ -3199,7 +3226,6 @@ def user_summary(user: User = Depends(get_current_user)):
     base_profit = 0.0
     if name.lower() == 'founders':
         try:
-            import json
             from pathlib import Path
             balance_history_path = Path(__file__).parent.parent / "state" / "balance_history.json"
             if balance_history_path.exists():
@@ -3219,6 +3245,12 @@ def user_summary(user: User = Depends(get_current_user)):
     holdings_value = None
     usdc_balance = None
     usdc_breakdown: Dict[str, float] = {}
+    eoa_balance = 0.0
+    deposit_balance = 0.0
+    eoa_usdc_tokens: Dict[str, float] = {}
+    deposit_usdc_tokens: Dict[str, float] = {}
+    eoa_address = None
+    deposit_address = None
     address = None
     safe_funder = None
     funder_address = None
@@ -3242,39 +3274,39 @@ def user_summary(user: User = Depends(get_current_user)):
                 or _decrypt_session_key(acct.get("private_key"))
             )
             saved_owner = acct.get("wallet_owner")
-            candidate_safe = acct.get("safe_address")
-            if not candidate_safe:
-                # Backward compatibility: accept funder/proxy as safe only if it behaves like a Safe.
-                fallback_candidate = acct.get("funder") or acct.get("proxy_wallet")
-                if isinstance(fallback_candidate, str) and ETH_ADDR_RE.match(fallback_candidate):
-                    owners = _safe_owners_from_address(fallback_candidate, _chain_id_default())
-                    if owners:
-                        candidate_safe = fallback_candidate
-                        if not saved_owner:
-                            saved_owner = owners[0]
-            safe_address = candidate_safe
-            safe_funder = safe_address
-            address = safe_address
-            funder_address = saved_owner
-            if funder_address and safe_address and str(funder_address).lower() == str(safe_address).lower():
-                owners = _safe_owners_from_address(safe_address, _chain_id_default())
-                if owners:
-                    funder_address = owners[0]
-                if str(funder_address).lower() == str(safe_address).lower():
-                    funder_address = None
-            if (not funder_address) and safe_address:
-                owners = _safe_owners_from_address(safe_address, _chain_id_default())
-                if owners:
-                    funder_address = owners[0]
-            if not address and target_priv and target_priv.startswith('0x') and 'REPLACE_WITH_TEST' not in target_priv:
+            if target_priv and target_priv.startswith('0x') and 'REPLACE_WITH_TEST' not in target_priv:
                 try:
-                    address = Account.from_key(target_priv).address
+                    eoa_address = Account.from_key(target_priv).address
                 except Exception:
-                    address = None
+                    eoa_address = None
+            if not eoa_address and isinstance(saved_owner, str) and ETH_ADDR_RE.match(saved_owner):
+                eoa_address = saved_owner
 
-            usdc_total, usdc_parts = _polygon_usdc_balance(safe_address)
-            usdc_balance = usdc_total
-            usdc_breakdown = usdc_parts
+            explicit_deposit = acct.get("deposit_wallet") or acct.get("deposit_wallet_address")
+            fallback_deposit = acct.get("safe_address") or acct.get("funder") or acct.get("proxy_wallet")
+            deposit_address = explicit_deposit or fallback_deposit
+            if isinstance(deposit_address, str) and not ETH_ADDR_RE.match(deposit_address):
+                deposit_address = None
+            if deposit_address and eoa_address and deposit_address.lower() == eoa_address.lower():
+                deposit_address = None
+
+            # Positions are held/traded by the deposit wallet when configured.
+            address = deposit_address or eoa_address
+            safe_address = deposit_address
+            safe_funder = deposit_address
+            funder_address = eoa_address
+
+            eoa_total, eoa_parts = _polygon_usdc_balance(eoa_address)
+            eoa_balance = float(eoa_total or 0.0)
+            eoa_usdc_tokens = eoa_parts
+            deposit_total, deposit_parts = _polygon_usdc_balance(deposit_address)
+            deposit_balance = float(deposit_total or 0.0)
+            deposit_usdc_tokens = deposit_parts
+            usdc_balance = eoa_balance + deposit_balance
+            usdc_breakdown = {
+                **{f"EOA {key}": value for key, value in eoa_parts.items()},
+                **{f"Deposit {key}": value for key, value in deposit_parts.items()},
+            }
 
         if address:
             # Try authenticated API first for more accurate data
@@ -3310,8 +3342,25 @@ def user_summary(user: User = Depends(get_current_user)):
                 unrealized = total_pnl - realized
     except Exception as e:
         print(f"Error user summary polymarket pnl: {e}")
+    current_stake = None
+    try:
+        session_path = STATE / name / "session_state.json"
+        session_state = json.loads(session_path.read_text(encoding="utf-8")) if session_path.exists() else {}
+        current_stake = float(session_state.get("session_stake") or 0.0)
+        if current_stake <= 0:
+            current_stake = None
+    except Exception:
+        current_stake = None
+    if current_stake is None and usdc_balance is not None:
+        current_stake = max(1.0, float(usdc_balance) * 0.15)
     total_profit = total_pnl + base_profit
     display_safe_balance = usdc_balance if usdc_balance is not None else holdings_value
+    db = _load_users()
+    account_user = db.get(name, {}) if isinstance(db.get(name), dict) else {}
+    selected_account = _find_trading_account(_trading_accounts_ref(db), name)
+    selected_paused = bool(account_user.get("paused", False))
+    if selected_account is not None and not _is_account_enabled(selected_account):
+        selected_paused = True
     return {
         "date": d.isoformat(),
         "positions": {"UP": cost["UP"], "DOWN": cost["DOWN"]},
@@ -3321,14 +3370,24 @@ def user_summary(user: User = Depends(get_current_user)):
         "safe_address": safe_address or safe_funder or address,
         "safe_funder": safe_funder or address,
         "safe_balance": display_safe_balance,
-        "safe_balance_source": "polygon_usdc" if usdc_balance is not None else "polymarket_holdings",
+        "total_balance": display_safe_balance,
+        "eoa_balance": eoa_balance,
+        "deposit_balance": deposit_balance,
+        "eoa_address": eoa_address,
+        "deposit_address": deposit_address,
+        "current_stake": current_stake,
+        "current_position_value": up_val + dn_val,
+        "safe_balance_source": "combined_polygon_collateral" if usdc_balance is not None else "polymarket_holdings",
         "safe_usdc_tokens": usdc_breakdown,
+        "eoa_usdc_tokens": eoa_usdc_tokens,
+        "deposit_usdc_tokens": deposit_usdc_tokens,
         "realized_profit": realized,
         "unrealized_profit": unrealized,
         "total_pnl": total_pnl,
         "holdings_value": holdings_value,
         "base_profit": base_profit,
         "total_profit": total_profit,
+        "paused": selected_paused,
     }
 
 
@@ -3578,6 +3637,7 @@ def spa_catch_all(full_path: str):
 
 def main():
     port = int(os.environ.get("PORT", "8000"))
+    host = os.environ.get("HOST", "0.0.0.0")
     # Start background recorder thread before serving
     global _recorder_thread, _recorder_stop
     _recorder_stop.clear()
@@ -3590,10 +3650,10 @@ def main():
         ssl_key = os.environ.get("SSL_KEY_PATH")
         
         if ssl_cert and ssl_key and os.path.exists(ssl_cert) and os.path.exists(ssl_key):
-            print(f"Starting HTTPS server on https://10.0.0.147:{port}")
+            print(f"Starting HTTPS server on https://{host}:{port}")
             uvicorn.run(
                 app,
-                host=os.environ.get("HOST", "0.0.0.0"),
+                host=host,
                 port=port,
                 reload=False,
                 ssl_keyfile=ssl_key,
@@ -3601,11 +3661,11 @@ def main():
                 timeout_graceful_shutdown=2,
             )
         else:
-            print(f"Starting HTTP server on http://10.0.0.147:{port}")
+            print(f"Starting HTTP server on http://{host}:{port}")
             print("To enable HTTPS, set SSL_CERT_PATH and SSL_KEY_PATH environment variables")
             uvicorn.run(
                 app,
-                host=os.environ.get("HOST", "0.0.0.0"),
+                host=host,
                 port=port,
                 reload=False,
                 timeout_graceful_shutdown=2,

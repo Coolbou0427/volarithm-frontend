@@ -12,6 +12,11 @@ const MARKET_SERIES_REFRESH_MS = 60000;
 let marketEmbedInFlight = false;
 let marketSeriesCache = null;
 let marketSeriesLastRefreshMs = 0;
+let userStatsHasData = false;
+let userStatsLastRefreshMs = 0;
+let userStatsAccountName = null;
+let userStatsRequestId = 0;
+const USER_STATS_CACHE_MS = 15000;
 
 // The modern workspace is the sole supported interface; the legacy theme has
 // no conditional stylesheet or per-browser toggle.
@@ -106,13 +111,13 @@ function routeFromLocation(){
     if (!(p.startsWith('/user') || p.startsWith('/home'))) stopMarketLiveUpdates();
     if (p.startsWith('/admin')) { if (isAuthed() && isAdmin){ show('#page-admin'); loadAdmin(); } else { show('#page-home'); } closeMenus(); return; }
     if (p.startsWith('/profile')) { if (isAuthed()){ loadProfile(); show('#page-profile'); } else { show('#page-home'); } closeMenus(); return; }
-    if (p.startsWith('/user') || p.startsWith('/home')) { if (isAuthed()){ show('#page-user'); loadUserData(); } else { show('#page-home'); } closeMenus(); return; }
+    if (p.startsWith('/user') || p.startsWith('/home')) { if (isAuthed()){ show('#page-user'); loadUserData({preserve:true}); } else { show('#page-home'); } closeMenus(); return; }
     if (p.startsWith('/about')) { show('#page-home'); closeMenus(); return; }
     // Default routing: if authenticated, go to user page; otherwise home
     if (isAuthed()) {
         history.replaceState(null, '', '/user');
         show('#page-user');
-        loadUserData();
+        loadUserData({preserve:true});
     } else {
         show('#page-home');
     }
@@ -124,7 +129,7 @@ function routeFromHash(){
     if (!(h.startsWith('#/user') || h.startsWith('#/home'))) stopMarketLiveUpdates();
     if (h.startsWith('#/admin')) { if (isAuthed() && isAdmin){ show('#page-admin'); loadAdmin(); } else { show('#page-home'); } return true; }
     if (h.startsWith('#/profile')) { if (isAuthed()){ loadProfile(); show('#page-profile'); } else { show('#page-home'); } return true; }
-    if (h.startsWith('#/user') || h.startsWith('#/home')) { if (isAuthed()){ show('#page-user'); loadUserData(); } else { show('#page-home'); } return true; }
+    if (h.startsWith('#/user') || h.startsWith('#/home')) { if (isAuthed()){ show('#page-user'); loadUserData({preserve:true}); } else { show('#page-home'); } return true; }
     if (h.startsWith('#/about')) { show('#page-home'); return true; }
     return false;
 }
@@ -1141,7 +1146,6 @@ function stopMarketLiveUpdates(){
         clearInterval(marketLiveTimer);
         marketLiveTimer = null;
     }
-    marketSeriesLastRefreshMs = 0;
 }
 
 async function fetchLocalMarketSeries(active, slug){
@@ -1398,18 +1402,21 @@ async function updatePolymarketEmbed(opts = {}) {
 }
 
 // User page
-async function loadUserData(){
+async function loadUserData(opts = {}){
+    const preserve = opts.preserve === true && userStatsHasData;
     // Set loading state to prevent layout shifts
     const userPage = document.getElementById('page-user');
-    if (userPage) {
+    if (userPage && !preserve) {
         userPage.setAttribute('data-loading', 'true');
     }
     stopMarketLiveUpdates();
 
     try {
         // Start status and market embed in parallel so neither blocks the other
-        const statsPromise = loadUserStats();
-        const embedPromise = updatePolymarketEmbed();
+        const statsPromise = isAdmin ? Promise.resolve() : loadUserStats(null, {preserve});
+        const marketHost = document.getElementById('polymarket-embed-host');
+        const keepMarketVisible = !!(marketHost && marketHost.childElementCount);
+        const embedPromise = updatePolymarketEmbed({showLoading: !keepMarketVisible, setupLive:true, allowFastPath:true});
 
         const toolbar = document.getElementById('account-toolbar');
         const sel = document.getElementById('user-account');
@@ -1486,15 +1493,21 @@ async function loadUserData(){
         });
         initUserAccountMenu();
         if (sel.options.length){
-            sel.value = sel.options[0].value;
+            const preferred = Array.from(sel.options).find((opt)=> opt.value === currentUsername)
+                || sel.options[1]
+                || sel.options[0];
+            sel.value = preferred.value;
             syncUserAccountMenuFromSelect();
             await loadTrades(sel.value);
+            if (sel.value !== '*') await loadUserStats(sel.value, {preserve:true, force:true});
         } else {
             syncUserAccountMenuFromSelect();
         }
         sel.onchange = ()=>{
             syncUserAccountMenuFromSelect();
             loadTrades(sel.value);
+            const statsAccount = sel.value === '*' ? currentUsername : sel.value;
+            loadUserStats(statsAccount, {preserve:false, force:true});
         };
     }
     // Ensure the parallel tasks finish before we complete load
@@ -1511,7 +1524,12 @@ async function loadUserData(){
     }
 }
 
-async function loadUserStats() {
+async function loadUserStats(accountName = null, opts = {}) {
+    const requestedAccount = String(accountName || currentUsername || '').trim();
+    const preserve = opts.preserve === true && userStatsHasData;
+    const force = opts.force === true;
+    if (!force && userStatsHasData && userStatsAccountName === requestedAccount && (Date.now() - userStatsLastRefreshMs) < USER_STATS_CACHE_MS) return;
+    const requestId = ++userStatsRequestId;
     const statusIndicator = document.getElementById('status-indicator');
     const statusText = document.getElementById('status-text');
     const totalProfitElement = document.getElementById('user-total-profit');
@@ -1519,20 +1537,20 @@ async function loadUserStats() {
     const safeBalanceElement = document.getElementById('user-safe-balance');
 
     console.log('[loadUserStats] called');
-    if (statusIndicator) {
+    if (statusIndicator && !preserve) {
         statusIndicator.textContent = '';
         statusIndicator.style.display = 'none';
     }
     const botStatus = document.getElementById('user-bot-status');
-    if (botStatus) {
+    if (botStatus && !preserve) {
         botStatus.classList.add('loading-text');
     }
-    if (statusText) {
+    if (statusText && !preserve) {
         statusText.textContent = '';
         statusText.setAttribute('aria-label', 'Loading');
         statusText.classList.remove('loading-inline');
     }
-    [totalProfitElement, currentStakeElement, safeBalanceElement]
+    if (!preserve) [totalProfitElement, currentStakeElement, safeBalanceElement]
         .forEach((el)=>{
             if (!el) return;
             el.classList.add('loading-text');
@@ -1541,22 +1559,18 @@ async function loadUserStats() {
         });
 
     try {
-        // Kick off both requests concurrently
-        console.log('[loadUserStats] Fetching profile and summary in parallel...');
-        const profilePromise = fetch('/api/user/profile', { headers: authHeaders() });
-        const summaryPromise = fetch('/api/user/summary', { headers: authHeaders() });
+        console.log('[loadUserStats] Fetching account summary...');
+        const summaryUrl = accountName ? `/api/user/summary?account=${encodeURIComponent(accountName)}` : '/api/user/summary';
+        const summaryPromise = fetch(summaryUrl, { headers: authHeaders() });
+        let summary = {};
 
-        // Await profile first to set status ASAP
-        const profileResponse = await profilePromise;
-        console.log('[loadUserStats] Profile response status:', profileResponse.status);
-        if (!profileResponse.ok) throw new Error(`Profile API failed: ${profileResponse.status}`);
-        const profile = await profileResponse.json();
-        console.log('[loadUserStats] Profile loaded:', profile);
-
-        // Now handle summary without blocking status
+        // The summary is account-scoped for admins and includes the selected
+        // account's pause state. Ignore responses superseded by a newer choice.
         try {
             const summaryResponse = await summaryPromise;
-            const summary = summaryResponse.ok ? await summaryResponse.json() : {};
+            if (!summaryResponse.ok) throw new Error(`Summary API failed: ${summaryResponse.status}`);
+            summary = await summaryResponse.json();
+            if (requestId !== userStatsRequestId) return;
             console.log('[loadUserStats] Summary loaded:', summary);
             // Update total profit
             if (totalProfitElement && summary.total_profit !== undefined) {
@@ -1567,17 +1581,16 @@ async function loadUserStats() {
                 totalProfitElement.classList.add(profit >= 0 ? 'positive' : 'negative');
                 console.log('[loadUserStats] Profit updated:', profit);
             }
-            // Update current stake (position value)
-            if (currentStakeElement && summary.mark) {
-                const upValue = summary.mark.UP || 0;
-                const downValue = summary.mark.DOWN || 0;
-                const totalValue = upValue + downValue;
-                currentStakeElement.textContent = `$${totalValue.toFixed(2)}`;
+            // Display the persisted noon-to-noon budget, not position market value.
+            if (currentStakeElement) {
+                const rawStake = Number(summary.current_stake ?? 0);
+                const currentStake = Number.isFinite(rawStake) ? rawStake : 0;
+                currentStakeElement.textContent = `$${currentStake.toFixed(2)}`;
                 currentStakeElement.removeAttribute('aria-label');
-                console.log('[loadUserStats] Stake updated:', totalValue);
+                console.log('[loadUserStats] Stake updated:', currentStake);
             }
             if (safeBalanceElement) {
-                const raw = Number(summary.safe_balance ?? summary.holdings_value ?? 0);
+                const raw = Number(summary.total_balance ?? summary.safe_balance ?? summary.holdings_value ?? 0);
                 const safeBal = Number.isFinite(raw) ? raw : 0;
                 safeBalanceElement.textContent = `$${safeBal.toFixed(2)}`;
                 safeBalanceElement.removeAttribute('aria-label');
@@ -1586,12 +1599,14 @@ async function loadUserStats() {
                 .forEach((el)=> el && el.classList.remove('loading-text'));
         } catch (e) {
             console.warn('Summary load failed or incomplete:', e);
+            throw e;
         }
 
-        // Update trading status based on user's pause setting
+        if (requestId !== userStatsRequestId) return;
+        // Update trading status based on the selected account's pause setting.
         if (statusIndicator && statusText) {
-            const isPaused = profile.paused === true;
-            console.log('[loadUserStats] User paused status:', isPaused, 'from profile:', profile.paused);
+            const isPaused = summary.paused === true;
+            console.log('[loadUserStats] Account paused status:', isPaused);
             statusIndicator.style.display = '';
             statusIndicator.textContent = '●';
 
@@ -1618,13 +1633,17 @@ async function loadUserStats() {
             console.error('[loadUserStats] Status elements not found');
         }
 
+        userStatsHasData = true;
+        userStatsLastRefreshMs = Date.now();
+        userStatsAccountName = requestedAccount;
+
     } catch (error) {
         console.error('[loadUserStats] Error loading user stats:', error);
 
         // Set fallback values with proper error handling
-        if (totalProfitElement) totalProfitElement.textContent = '$0.00';
-        if (currentStakeElement) currentStakeElement.textContent = '$0.00';
-        if (safeBalanceElement) safeBalanceElement.textContent = '$0.00';
+        if (!preserve && totalProfitElement) totalProfitElement.textContent = '$0.00';
+        if (!preserve && currentStakeElement) currentStakeElement.textContent = '$0.00';
+        if (!preserve && safeBalanceElement) safeBalanceElement.textContent = '$0.00';
         if (totalProfitElement) totalProfitElement.removeAttribute('aria-label');
         if (currentStakeElement) currentStakeElement.removeAttribute('aria-label');
         if (safeBalanceElement) safeBalanceElement.removeAttribute('aria-label');
@@ -1979,7 +1998,7 @@ function syncUserAccountMenuFromSelect(){
         btn.addEventListener('click', ()=>{
             setUserAccountUIValue(opt.value);
             closeUserAccountMenu();
-            loadTrades(opt.value);
+            sel.dispatchEvent(new Event('change', {bubbles:true}));
         });
         menu.appendChild(btn);
     });
@@ -1996,6 +2015,11 @@ function initUserAccountMenu(){
         const open = menu.classList.contains('hidden');
         if (open){
             menu.classList.remove('hidden');
+            menu.classList.remove('open-up');
+            const rect = btn.getBoundingClientRect();
+            const menuHeight = Math.min(menu.scrollHeight, 320);
+            const below = window.innerHeight - rect.bottom - 12;
+            if (below < menuHeight && rect.top > below) menu.classList.add('open-up');
             btn.classList.add('open');
             btn.setAttribute('aria-expanded', 'true');
         } else {
@@ -3135,6 +3159,12 @@ async function loadStats() {
 function startStatsAutoRefresh() {
     setInterval(() => {
         loadStats(); // Simple background update
+    }, 30000);
+    setInterval(() => {
+        if (!isAuthed()) return;
+        const selected = document.getElementById('user-account')?.value;
+        const accountName = isAdmin && selected ? (selected === '*' ? currentUsername : selected) : null;
+        loadUserStats(accountName, {preserve:true, force:true});
     }, 30000);
 }
 

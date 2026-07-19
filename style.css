@@ -2786,6 +2786,28 @@ body .trade-history-card .tz-select-btn{
     background:#0b1118;
 }
 
+/* The account menu must be allowed to escape a short trade-history card.
+   It flips above the control when there is not enough viewport below it. */
+body #page-user > .trade-history-card{
+    position:relative;
+    z-index:20;
+    overflow:visible !important;
+}
+body .trade-history-card .toolbar,
+body .trade-history-card #user-account-ui{
+    position:relative;
+    z-index:30;
+}
+body .trade-history-card #user-account-menu{
+    max-height:min(320px, calc(100vh - 32px));
+    overflow-y:auto;
+    overscroll-behavior:contain;
+}
+body .trade-history-card #user-account-menu.open-up{
+    top:auto;
+    bottom:calc(100% + 6px);
+}
+
 body .trade-history-card .table-wrap{
     max-height:520px;
     border:0;
